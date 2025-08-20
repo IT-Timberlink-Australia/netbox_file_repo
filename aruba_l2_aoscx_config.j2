@@ -22,10 +22,10 @@ exit
 spanning-tree
 {% if spanning_tree.config_name -%}
 spanning-tree config-name {{ spanning_tree.config_name }}
-{% endif -%}
+{%- endif %}
 {% if spanning_tree.config_revision -%}
 spanning-tree config-revision {{ spanning_tree.config_revision }}
-{% endif -%}
+{%- endif %}
 {%- for interface in device.interfaces.all() %}
   {#- Debug output (commented out) #}
   {#- ! Processing interface: {{ interface.name }} #}
