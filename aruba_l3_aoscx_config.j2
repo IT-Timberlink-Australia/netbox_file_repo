@@ -58,14 +58,14 @@ spanning-tree config-revision {{ spanning_tree.config_revision }}
 {%- for interface in device.interfaces.all() %}
 
 {# Identify if this is an SVI by name "vlan <vid>" #}
-{%- set is_svi = interface.name|lower|regex_search('^vlan\\s*\\d+$') %}
-{%- set svi_vid = (
-      interface.name
-      |regex_replace('^vlan\\s*(\\d+)$','\\1')
-      |int
-   ) if is_svi else None %}
-
-{%- if not interface.mgmt_only %}
+{%- set parts = interface.name|lower|split(' ') %}
+{%- if parts|length == 2 and parts[0] == 'vlan' %}
+  {%- set is_svi = true %}
+  {%- set svi_vid = parts[1]|int %}
+{%- else %}
+  {%- set is_svi = false %}
+  {%- set svi_vid = none %}
+{%- endif %}
 
   {# ---------------- Routed or L2 physical ---------------- #}
   {%- if is_svi %}
