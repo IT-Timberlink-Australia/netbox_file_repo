@@ -89,7 +89,7 @@ int {{ interface.name }}
   exit {%- endif %}
 {%- endfor %}
 {%- for server in name_server %}
-ip dns server-address {{ server }} vrf default {%- endfor %}
+ip dns server-address {{ server }}{%- endfor %}
 {%- for domain in domain_name %}
 domain-name {{ domain }}{%- endfor %}
 snmp-server vrf {{ snmp_vrf }}
