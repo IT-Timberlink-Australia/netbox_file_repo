@@ -7,49 +7,24 @@
       User (iterable of usernames) + User.admin.password (list; we take first)
 ------------------------------------------------------------------------------ #}
 
-hostname {{ device.name }}
-
-{# --- Local admin users --- #}
-{%- if users is defined and users %}
-  {%- for u in users -%}
-user {{ u.name }} group administrators password ciphertext {{ u.ciphertext }}
-  {%- endfor -%}
-{%- elif User is defined %}
-  {%- set pw = '' -%}
-  {%- if User.admin is defined and User.admin.password is defined and (User.admin.password|length) > 0 -%}
-    {%- set pw = User.admin.password[0] -%}
-  {%- endif -%}
-  {%- for name in User -%}
-user {{ name }} group administrators password ciphertext {{ pw }}
-  {%- endfor -%}
-{%- endif %}
-
-{# --- Aruba Central (optional; render only if provided) --- #}
-{%- if aruba_central is defined %}
+hostname {{device.name}}
+{%- for name in User %}
+user {{ name }} group administrators password ciphertext {%- endfor %} {% for password in User.admin.password %}{{password}}{%- endfor %}
 aruba-central
   {{ aruba_central.status }}
-  {%- if aruba_central.location_override_location is defined and aruba_central.location_override_vrf is defined %}
   location-override {{ aruba_central.location_override_location }} vrf {{ aruba_central.location_override_vrf }}
-  {%- endif %}
   exit
-{%- endif %}
-
 ssh server vrf default
-clock timezone {{ device.site.time_zone|default('UTC') }}
-
+clock timezone {{ device.site.time_zone }}
 ntp enable
+{%- for server in ntp_server %}
 no ntp server pool.ntp.org
-{%- for server in ntp_server|default([]) -%}
-ntp server {{ server }} minpoll 4 maxpoll 4 iburst
-{%- endfor %}
-
-{# --- VLAN DB (skip reserved) --- #}
-{%- for vl in device.site.vlans.all() -%}
-  {%- if vl.status != "reserved" -%}
-vlan {{ vl.vid }}
-  name {{ vl.name }}
-  {%- endif -%}
-{%- endfor %}
+ntp server {{ server }} minpoll 4 maxpoll 4 iburst {%- endfor %}
+{%- for vl in device.site.vlans.all() %} 
+{%- if vl.status != "reserved" %}
+vlan {{vl.vid }}
+  name {{vl.name}}{%- endif %}{% endfor %}
+exit
 
 ip routing
 
