@@ -20,11 +20,9 @@ vlan {{vl.vid }}
   name {{vl.name}}{%- endif %}{% endfor %}
 exit
 spanning-tree
-{% if spanning_tree.config_name -%}
-spanning-tree config-name {{ spanning_tree.config_name }}
-{%- endif %}
-{% if spanning_tree.config_revision -%}
-spanning-tree config-revision {{ spanning_tree.config_revision }}
+{%- if spanning_tree.config_name or spanning_tree.config_revision %}
+{%- if spanning_tree.config_name %}spanning-tree config-name {{ spanning_tree.config_name }}{% endif %}
+{%- if spanning_tree.config_revision %}spanning-tree config-revision {{ spanning_tree.config_revision }}{% endif %}
 {%- endif %}
 {%- for interface in device.interfaces.all() %}
   {#- Debug output (commented out) #}
