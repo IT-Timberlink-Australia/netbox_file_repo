@@ -57,9 +57,13 @@ spanning-tree config-revision {{ spanning_tree.config_revision }}
 {# --- Interfaces (L2 & L3) --- #}
 {%- for interface in device.interfaces.all() %}
 
-{# Identify if this is an SVI by name "vlanX" (common NetBox convention) #}
-{%- set is_svi = interface.name|lower startswith 'vlan' %}
-{%- set svi_vid = interface.name|regex_search('^vlan\\s*(\\d+)$') and (interface.name|regex_replace('^vlan\\s*(\\d+)$','\\1')|int) %}
+{# Identify if this is an SVI by name "vlan <vid>" #}
+{%- set is_svi = interface.name|lower|regex_search('^vlan\\s*\\d+$') %}
+{%- set svi_vid = (
+      interface.name
+      |regex_replace('^vlan\\s*(\\d+)$','\\1')
+      |int
+   ) if is_svi else None %}
 
 {%- if not interface.mgmt_only %}
 
