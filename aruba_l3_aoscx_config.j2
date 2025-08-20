@@ -1,0 +1,216 @@
+{# ------------------------------------------------------------------------------
+  NetBox → ArubaOS-CX (10.14) L3 switch template
+  - Adds: ip routing, VRFs, SVIs, routed ports, static routes, DHCP relay, OSPF (optional)
+  - Keeps: your L2 interface logic, STP, NTP, DNS, SNMP, Central block
+  - Aggressive whitespace trimming to avoid blank-line drift
+  ------------------------------------------------------------------------------ #}
+
+{# Hostname #}
+hostname {{ device.name }}
+
+{# Local admin users #}
+{%- for u in users|default([]) %}
+user {{ u.name }} group administrators password ciphertext {{ u.ciphertext }}
+{%- endfor %}
+
+{# Aruba Central #}
+aruba-central
+  {{ aruba_central.status }}
+  location-override {{ aruba_central.location_override_location }} vrf {{ aruba_central.location_override_vrf }}
+  exit
+
+{# Base services #}
+ssh server vrf default
+clock timezone {{ device.site.time_zone }}
+
+ntp enable
+no ntp server pool.ntp.org
+{%- for server in ntp_server|default([]) %}
+ntp server {{ server }} minpoll 4 maxpoll 4 iburst
+{%- endfor %}
+
+{# --- L2 VLAN database (skip reserved) --- #}
+{%- for vl in device.site.vlans.all() %}
+{%- if vl.status != "reserved" %}
+vlan {{ vl.vid }}
+  name {{ vl.name }}
+{%- endif %}
+{%- endfor %}
+
+{# --- Enable global L3 routing --- #}
+ip routing
+
+{# --- VRFs (optional) --- #}
+{%- for v in vrfs|default([]) if v|lower != 'default' %}
+vrf {{ v }}
+{%- endfor %}
+
+{# --- Spanning-tree (still relevant for access/trunk ports) --- #}
+spanning-tree
+{%- if spanning_tree.config_name %}
+spanning-tree config-name {{ spanning_tree.config_name }}
+{%- endif %}
+{%- if spanning_tree.config_revision %}
+spanning-tree config-revision {{ spanning_tree.config_revision }}
+{%- endif %}
+
+{# --- Interfaces (L2 & L3) --- #}
+{%- for interface in device.interfaces.all() %}
+
+{# Identify if this is an SVI by name "vlanX" (common NetBox convention) #}
+{%- set is_svi = interface.name|lower startswith 'vlan' %}
+{%- set svi_vid = interface.name|regex_search('^vlan\\s*(\\d+)$') and (interface.name|regex_replace('^vlan\\s*(\\d+)$','\\1')|int) %}
+
+{%- if not interface.mgmt_only %}
+
+  {# ---------------- Routed or L2 physical ---------------- #}
+  {%- if is_svi %}
+    {# ---------------- SVI: interface vlan <vid> ---------------- #}
+interface vlan {{ svi_vid }}
+    {%- if interface.enabled %}
+  description {{ interface.description|default("SVI-" ~ svi_vid) }}
+  no shutdown
+      {# IPv4 addresses on SVI #}
+      {%- for ip in interface.ip_addresses.all() if ip.family == 4 %}
+  ip address {{ ip.address }}
+      {%- else %}
+  ! Warning: SVI has no IPv4 address
+      {%- endfor %}
+      {# DHCP relay (helpers) if provided #}
+      {%- if dhcp_relays is defined and dhcp_relays.get(svi_vid) %}
+        {%- for helper in dhcp_relays.get(svi_vid) %}
+  ip helper-address {{ helper }}
+        {%- endfor %}
+      {%- endif %}
+      {# OSPF per-interface (optional) #}
+      {%- if ospf is defined and ospf.enabled and ospf.interfaces is defined %}
+        {%- for oi in ospf.interfaces if oi.name|lower == ("vlan " ~ svi_vid)|lower %}
+  ip ospf area {{ oi.area }}
+        {%- endfor %}
+      {%- endif %}
+    {%- else %}
+  shutdown
+    {%- endif %}
+
+  {%- else %}
+    {# ---------------- Non-SVI interface (physical or LAG member) ---------------- #}
+interface {{ interface.name }}
+    {%- if not interface.enabled %}
+  no description
+  shutdown
+    {%- else %}
+  description {{ interface.description|default("")|truncate(240) }}
+  no shutdown
+
+      {# Routed port? Treat as L3 if mode==routed or it owns an IP #}
+      {%- set has_v4 = (interface.ip_addresses.all()|selectattr('family','equalto',4)|list)|length > 0 %}
+      {%- if interface.mode is defined and interface.mode == "routed" or has_v4 %}
+  routing
+        {%- for ip in interface.ip_addresses.all() if ip.family == 4 %}
+  ip address {{ ip.address }}
+        {%- else %}
+  ! Warning: Routed port has no IPv4 address
+        {%- endfor %}
+        {# OSPF per-interface (optional) #}
+        {%- if ospf is defined and ospf.enabled and ospf.interfaces is defined %}
+          {%- for oi in ospf.interfaces if oi.name|lower == interface.name|lower %}
+  ip ospf area {{ oi.area }}
+          {%- endfor %}
+        {%- endif %}
+      {%- else %}
+        {# L2 modes: access / tagged / tagged-all (same as your L2 template) #}
+        {%- if interface.mode == "access" and interface.untagged_vlan is not none %}
+  vlan access {{ interface.untagged_vlan.vid }}
+        {%- elif interface.mode == "tagged" %}
+          {%- if interface.untagged_vlan is not none %}
+  vlan trunk native {{ interface.untagged_vlan.vid }}
+          {%- endif %}
+          {%- set tagged = interface.tagged_vlans.all() if interface.tagged_vlans.exists() else [] %}
+  vlan trunk allowed {{ tagged|map(attribute='vid')|join(',') }}
+          {%- if "lag" in interface.name|lower %}
+  lacp mode active
+          {%- endif %}
+        {%- elif interface.mode and "tagged-all" in interface.mode|lower %}
+  vlan trunk native {{ interface.untagged_vlan.vid if interface.untagged_vlan is not none else 799 }}
+  vlan trunk allowed all
+          {%- if "lag" in interface.name|lower %}
+  lacp mode active
+          {%- endif %}
+        {%- endif %}
+        {# LAG membership #}
+        {%- if interface.lag is not none %}
+          {%- set lag_id = interface.lag.name|regex_replace('[^0-9]', '') %}
+          {%- if lag_id %}
+  lag {{ lag_id }}
+          {%- endif %}
+        {%- endif %}
+      {%- endif %}
+    {%- endif %}
+
+  {%- endif %}
+
+{%- else %}
+  {# ---------------- Management-only interface ---------------- #}
+interface {{ interface.name }}
+  {%- if interface.enabled %}
+  description {{ interface.description|default("MGMT") }}
+  no shutdown
+    {%- set mgmt_ips = interface.ip_addresses.all() %}
+    {%- if mgmt_ips %}
+      {%- for ip in mgmt_ips if ip.family == 4 %}
+  ip address {{ ip.address }}
+      {%- else %}
+  ! Warning: Interface has IPs but no IPv4 address
+      {%- endfor %}
+    {%- else %}
+  ! Warning: No IP addresses assigned to management interface
+    {%- endif %}
+  {%- else %}
+  shutdown
+  {%- endif %}
+{%- endif %}
+
+{%- endfor %}
+
+{# DNS & domain #}
+{%- for server in name_server|default([]) %}
+ip dns server-address {{ server }}
+{%- endfor %}
+{%- for d in domain_name|default([]) %}
+ip domain-name {{ d }}
+{%- endfor %}
+
+{# SNMP #}
+snmp-server vrf {{ snmp_vrf }}
+snmp-server system-location {{ device.rack }}
+snmp-server system-contact {{ snmp_system_contact }}
+snmp-server system-description {{ device.description }}
+snmp-server community {{ snmp_community }}
+
+{# --- Static routes (supports string or list of dicts) --- #}
+{%- if ip_routes is defined %}
+  {%- if ip_routes is string %}
+ip route {{ ip_routes }}
+  {%- elif ip_routes is iterable %}
+    {%- for r in ip_routes %}
+      {%- set vrf_name = r.vrf|default('default') %}
+      {%- if vrf_name|lower == 'default' %}
+ip route {{ r.prefix }} {{ r.next_hop }}{% if r.distance is defined %} {{ r.distance }}{% endif %}
+      {%- else %}
+ip route vrf {{ vrf_name }} {{ r.prefix }} {{ r.next_hop }}{% if r.distance is defined %} {{ r.distance }}{% endif %}
+      {%- endif %}
+    {%- endfor %}
+  {%- endif %}
+{%- endif %}
+
+{# --- OSPF global (optional; CX typically uses interface-based OSPF config) --- #}
+{%- if ospf is defined and ospf.enabled %}
+  {%- set ospf_vrf = ospf.vrf|default('default') %}
+  {%- if ospf_vrf|lower == 'default' %}
+router ospf
+  router-id {{ ospf.router_id }}
+  {%- else %}
+router ospf vrf {{ ospf_vrf }}
+  router-id {{ ospf.router_id }}
+  {%- endif %}
+{%- endif %}
