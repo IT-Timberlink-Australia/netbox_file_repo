@@ -29,14 +29,16 @@ user {{ u.name }} group administrators password ciphertext {{ u.ciphertext }}
 {%- endfor %}
 
 {# Aruba Central (optional) #}
+{%- if aruba_central is defined %}
 aruba-central
   {{ aruba_central.status }}
   location-override {{ aruba_central.location_override_location }} vrf {{ aruba_central.location_override_vrf }}
   exit
+{%- endif %}
 
 {# Base services #}
 ssh server vrf default
-clock timezone {{ device.site.time_zone }}
+clock timezone {{ device.site.time_zone|default('UTC') }}
 
 ntp enable
 no ntp server pool.ntp.org
@@ -64,10 +66,10 @@ vrf {{ v }}
 
 {# Spanning-tree (still relevant for L2 access/trunk) #}
 spanning-tree
-{%- if spanning_tree.config_name %}
+{%- if spanning_tree is defined and spanning_tree.config_name %}
 spanning-tree config-name {{ spanning_tree.config_name }}
 {%- endif %}
-{%- if spanning_tree.config_revision %}
+{%- if spanning_tree is defined and spanning_tree.config_revision %}
 spanning-tree config-revision {{ spanning_tree.config_revision }}
 {%- endif %}
 
@@ -213,19 +215,15 @@ interface {{ interface.name }}
 {%- endfor %}
 
 {# DNS & domain #}
-{%- for server in name_server|default([]) %}
-ip dns server-address {{ server }}
-{%- endfor %}
-{%- for d in domain_name|default([]) %}
-ip domain-name {{ d }}
-{%- endfor %}
+{%- for server in name_server|default([]) %}ip dns server-address {{ server }}{% endfor -%}
+{%- for d in domain_name|default([]) %}ip domain-name {{ d }}{% endfor -%}
 
 {# SNMP #}
-snmp-server vrf {{ snmp_vrf }}
-snmp-server system-location {{ device.rack }}
-snmp-server system-contact {{ snmp_system_contact }}
-snmp-server system-description {{ device.description }}
-snmp-server community {{ snmp_community }}
+snmp-server vrf {{ snmp_vrf|default('default') }}
+snmp-server system-location {{ device.rack|default('') }}
+snmp-server system-contact {{ snmp_system_contact|default('') }}
+snmp-server system-description {{ device.description|default('') }}
+snmp-server community {{ snmp_community|default('public') }}
 
 {# Static routes (string or list of dicts) #}
 {%- if ip_routes is defined and ip_routes %}
