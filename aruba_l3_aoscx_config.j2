@@ -1,8 +1,9 @@
 {# ------------------------------------------------------------------------------
   NetBox → ArubaOS-CX 10.14 L3 Switch Template (NetBox-safe)
-  - No regex_* filters or Python string methods.
-  - Balanced blocks; aggressive whitespace control to avoid blank lines.
+  - No regex_* filters, no split(), no list mutation, no Python string methods.
+  - Balanced blocks; whitespace-trimmed to avoid blank lines.
   - Adds L3: ip routing, SVIs, routed ports, VRFs, static routes, optional OSPF & DHCP relay.
+
   Expected context keys (examples):
     users: [{name: "admin", ciphertext: "$6$..."}]
     ntp_server: ["10.10.10.10","10.10.10.11"]
@@ -15,9 +16,9 @@
       interfaces:
         - { name: "vlan 10", area: 0 }
         - { name: "1/1/49", area: 0 }
-    ip_routes:                               # EITHER:
+    ip_routes:
       - { prefix: "0.0.0.0/0", next_hop: "10.10.10.1", vrf: "default", distance: 1 }
-  ------------------------------------------------------------------------------ #}
+------------------------------------------------------------------------------ #}
 
 {# Hostname #}
 hostname {{ device.name }}
@@ -73,11 +74,11 @@ spanning-tree config-revision {{ spanning_tree.config_revision }}
 {# Interfaces #}
 {%- for interface in device.interfaces.all() %}
 
-{# SVI detection without regex/methods: expect "vlan <vid>" #}
-{%- set parts = interface.name|lower|split(' ') %}
-{%- set is_svi = (parts|length == 2 and parts[0] == 'vlan') %}
+{# SVI detection WITHOUT split/regex: expect exact prefix "vlan " then digits #}
+{%- set name_l = interface.name|lower %}
+{%- set is_svi = (name_l[:5] == 'vlan ' and name_l|length > 5) %}
 {%- if is_svi %}
-  {%- set svi_vid = parts[1]|int %}
+  {%- set svi_vid = name_l[5:]|int %}
 {%- else %}
   {%- set svi_vid = none %}
 {%- endif %}
@@ -162,13 +163,11 @@ interface {{ interface.name }}
           {%- if interface.untagged_vlan is not none %}
   vlan trunk native {{ interface.untagged_vlan.vid }}
           {%- endif %}
-          {%- set tagged = [] %}
-          {%- if interface.tagged_vlans is defined and interface.tagged_vlans.exists() %}
-            {%- for tv in interface.tagged_vlans.all() %}
-              {%- set _ = tagged.append(tv.vid) %}
-            {%- endfor %}
+          {# Build allowed list inline to avoid list ops #}
+          {%- set tvs = interface.tagged_vlans.all() %}
+          {%- if tvs|length > 0 %}
+  vlan trunk allowed {%- for tv in tvs -%}{{ tv.vid }}{%- if not loop.last -%},{%- endif -%}{%- endfor %}
           {%- endif %}
-  vlan trunk allowed {{ tagged|join(',') }}
           {%- if 'lag' in interface.name|lower %}
   lacp mode active
           {%- endif %}
@@ -179,10 +178,9 @@ interface {{ interface.name }}
   lacp mode active
           {%- endif %}
         {%- endif %}
-        {# LAG membership: strip common prefixes without regex #}
+        {# LAG membership: emit numeric suffix using chained replace (no regex) #}
         {%- if interface.lag is not none and interface.lag.name %}
-          {%- set lagname = interface.lag.name|lower %}
-          {%- set lagnum = lagname|replace('lag','')|replace('ae','')|replace('port-channel','')|replace(' ','') %}
+          {%- set lagnum = interface.lag.name|lower|replace('lag','')|replace('ae','')|replace('port-channel','')|replace(' ','') %}
           {%- if lagnum %}
   lag {{ lagnum }}
           {%- endif %}
@@ -229,7 +227,7 @@ snmp-server system-contact {{ snmp_system_contact }}
 snmp-server system-description {{ device.description }}
 snmp-server community {{ snmp_community }}
 
-{# Static routes (list of dicts) #}
+{# Static routes (string or list of dicts) #}
 {%- if ip_routes is defined and ip_routes %}
   {%- if ip_routes is string %}
 ip route {{ ip_routes }}
@@ -237,9 +235,9 @@ ip route {{ ip_routes }}
     {%- for r in ip_routes %}
       {%- set vrf_name = r.vrf|default('default') %}
       {%- if vrf_name|lower == 'default' %}
-ip route {{ r.prefix }} {{ r.next_hop }}{% if r.distance is defined %} {{ r.distance }}{% endif %}
+ip route {{ r.prefix }} {{ r.next_hop }}{%- if r.distance is defined %} {{ r.distance }}{%- endif %}
       {%- else %}
-ip route vrf {{ vrf_name }} {{ r.prefix }} {{ r.next_hop }}{% if r.distance is defined %} {{ r.distance }}{% endif %}
+ip route vrf {{ vrf_name }} {{ r.prefix }} {{ r.next_hop }}{%- if r.distance is defined %} {{ r.distance }}{%- endif %}
       {%- endif %}
     {%- endfor %}
   {%- endif %}
@@ -248,11 +246,13 @@ ip route vrf {{ vrf_name }} {{ r.prefix }} {{ r.next_hop }}{% if r.distance is d
 {# OSPF global (optional) #}
 {%- if ospf is defined and ospf.enabled %}
   {%- set ospf_vrf = ospf.vrf|default('default') %}
-  {%- if ospf_vrf|lower == 'default' %}
+  {%- if ospf.router_id is defined %}
+    {%- if ospf_vrf|lower == 'default' %}
 router ospf
   router-id {{ ospf.router_id }}
-  {%- else %}
+    {%- else %}
 router ospf vrf {{ ospf_vrf }}
   router-id {{ ospf.router_id }}
+    {%- endif %}
   {%- endif %}
 {%- endif %}
