@@ -1,0 +1,99 @@
+{#- Debug header (commented out) #}
+{#- ! Template generated for {{ device.name|default("UNKNOWN_DEVICE") }} #}
+{#- ! NetBox version: {{ netbox_version }} #}
+hostname {{device.name}}
+{%- for name in User %}
+user {{ name }} group administrators password ciphertext {%- endfor %} {% for password in User.admin.password %}{{password}}{%- endfor %}
+aruba-central
+  {{ aruba_central.status }}
+  location-override {{ aruba_central.location_override_location }} vrf {{ aruba_central.location_override_vrf }}
+  exit
+ssh server vrf default
+clock timezone {{ device.site.time_zone }}
+ntp enable
+{%- for server in ntp_server %}
+no ntp server pool.ntp.org
+ntp server {{ server }} minpoll 4 maxpoll 4 iburst {%- endfor %}
+{%- for vl in device.site.vlans.all() %} 
+{%- if vl.status != "reserved" %}
+vlan {{vl.vid }}
+  name {{vl.name}}{%- endif %}{% endfor %}
+exit
+spanning-tree
+spanning-tree config-name {{spanning_tree.config_name }}
+spanning-tree config-revision {{spanning_tree.config_revision }}
+{%- for interface in device.interfaces.all() %}
+  {#- Debug output (commented out) #}
+  {#- ! Processing interface: {{ interface.name }} #}
+  {#- ! Mode: {{ interface.mode|default("None") }}, Mgmt: {{ interface.mgmt_only|default("None") }}, Enabled: {{ interface.enabled|default("None") }} #}
+  {#- ! IPs: {{ interface.ip_addresses.all()|map(attribute='address')|join(', ') or 'None' }}  #}
+  {#- #}
+  {#- #}
+  {%- if interface.mgmt_only == false %}
+    {%- if interface.enabled == false %}
+int {{ interface.name }}
+  no desc
+  shut
+   {#- check if interface is enabled #}
+  {%- elif interface.enabled == true %}
+int {{ interface.name }}
+  desc {{ interface.description|default("")|truncate(240) }}
+  no shut
+    {%- endif %}
+    {#- check if interface mode is access #}
+    {%- if interface.mode == "access" and interface.untagged_vlan is not none %}
+  vlan access {{ interface.untagged_vlan.vid }}
+  {%- elif interface.mode == "tagged" %}
+      {%- if interface.untagged_vlan is not none %}
+  vlan trunk native {{ interface.untagged_vlan.vid }}
+      {%- endif %}
+      {%- with tagged_vlans = interface.tagged_vlans.all() if interface.tagged_vlans.exists() else [] %}
+  vlan trunk allowed {% for vlan in tagged_vlans %}{{ vlan.vid }}{% if not loop.last %},{% endif %}{% endfor %}
+      {%- endwith %}
+      {%- if "lag" in interface.name|lower %}
+  lacp mode active
+      {%- endif %}
+  {%- elif interface.mode and "tagged-all" in interface.mode|lower %}
+  vlan trunk native {% if interface.untagged_vlan is none %}799{% else %}{{ interface.untagged_vlan.vid }}{% endif %}
+  vlan trunk allowed all
+      {%- if "lag" in interface.name|lower %}
+  lacp mode active
+      {%- endif %}
+  {%- endif %}
+    {%- if interface.lag is not none %}
+      {%- set lag_id = interface.lag.name|regex_replace('[^0-9]','') %}
+      {%- if lag_id %}
+  lag {{ lag_id }}
+  {%- endif %}
+    {%- endif %}
+  {%- elif interface.mgmt_only == true %}
+int {{ interface.name }}
+    {%- if interface.enabled == false %}
+    {%- else %}
+  desc {{ interface.description|default("MGMT") }}
+  no shut
+      {%- set mgmt_ips = interface.ip_addresses.all() %}
+      {%- if mgmt_ips %}
+        {%- for ip in mgmt_ips if ip.family == 4 %}
+  ip address {{ ip.address }}
+        {%- else %}
+  ! Warning: Interface has IPs but no IPv4 address
+        {%- endfor %}
+      {%- else %}
+  ! Warning: No IP addresses assigned to management interface
+      {%- endif %}
+    {%- endif %}
+  exit {%- endif %}
+{%- endfor %}
+{%- for server in name_server %}
+ip dns server-address {{ server }} vrf default {%- endfor %}
+{%- for domain in domain_name %}
+domain-name {{ domain }}{%- endfor %}
+snmp-server vrf {{ snmp_vrf }}
+snmp-server system-location {{ device.rack }}
+snmp-server system-contact {{ snmp_system_contact }}
+snmp-server system-description {{ device.description }}
+snmp-server community {{ snmp_community }}
+exit
+ip route {{ ip_route }}
+exit
