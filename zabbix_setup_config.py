@@ -6,20 +6,19 @@ from django.apps import apps
 from django.db import transaction
 from django.db.models import ManyToManyField, ForeignKey
 
-# ---- Config / expectations from your API (27 rows today) ----
-COT_HUMAN = "zabbix-template-list"  # only for logs (matches your endpoint)  # :contentReference[oaicite:1]{index=1}
+# Human label for logs only (matches your endpoint)
+COT_HUMAN = "zabbix-template-list"  # API shows 27 rows with platform[], template_* fields
 
-# Preferred keys for fields (column or JSON)
+# Preferred keys we’ll look for inside row data (columns or JSON blobs)
 NAME_KEYS   = ("template_name", "name", "template")
 ID_KEYS     = ("template_id", "id", "zabbix_template_id")
 IFACE_KEYS  = ("template_interface_id", "iface_id", "interface_id")
 
-# Likely JSON containers on entry rows
+# Field names we try first for JSON container (still fallback to “any dict field”)
 JSON_CONTAINERS = ("data", "payload", "attributes", "values")
 
-# Ways platforms might show up
-PLATFORM_FIELD_NAMES = ("platform", "platforms")
-PLATFORM_JSON_KEYS   = (
+# Platform keys that may appear in JSON
+PLATFORM_JSON_KEYS = (
     "platform", "platforms",
     "platform_id", "platform_ids", "platform_pk", "platform_pks",
     "platform_name", "platform_names", "platform_slug", "platform_slugs",
@@ -28,15 +27,18 @@ PLATFORM_JSON_KEYS   = (
 class ZabbixConfigFromCOT(Script):
     """
     Zabbix readiness & mappings from Custom Object 'zabbix-template-list'
-    - Primary template by Platform (with name fallback)
-    - zabbix_template_id = primary + extras (CSV)
-    - SLA from role.sla_report_code
-    - Readiness gates & final status 'In-progress' on success
+      • Primary template by Platform (with name fallback)
+      • zabbix_template_id = [primary] + extras (CSV)
+      • SLA from role.custom_fields.sla_report_code
+      • Readiness gates; final 'In-progress' on success
+
+    Field renames honored: mon_req, zabbix_extra_templates
+    Groups / proxies intentionally not used.
     """
 
     class Meta:
         name = "Zabbix: COT Template + SLA + Readiness (platform primary)"
-        description = "Resilient loader for Custom Objects entries; primary by Platform; extras to IDs; SLA & readiness."
+        description = "Reads Custom Objects entries (JSON-backed) to map templates by Platform; builds template IDs; sets SLA; readiness."
         commit_default = True
 
     # Scope
@@ -51,10 +53,10 @@ class ZabbixConfigFromCOT(Script):
     )
     dry_run = BooleanVar(default=False, description="Force dry run (ignore Meta.commit)")
 
-    # Debug (optional)
+    # Debug
     debug_catalog = BooleanVar(default=False, required=False, description="Verbose discovery logs for the catalog model")
 
-    # ---------- basic utils ----------
+    # --------- tiny utils ----------
     def _norm_str(self, v):
         if v is None: return None
         if isinstance(v, str):
@@ -80,164 +82,157 @@ class ZabbixConfigFromCOT(Script):
     def _role(self, obj):
         return getattr(obj, "device_role", None) or getattr(obj, "role", None)
 
-    # ---------- JSON helpers ----------
-    def _json_container_name(self, Model):
+    # --------- JSON helpers ----------
+    def _json_container_names(self, Model):
+        # prefer common names but fall back to “any dict-like field per-row”
         fields = {f.name for f in Model._meta.get_fields() if hasattr(f, "attname")}
-        for cand in JSON_CONTAINERS:
-            if cand in fields:
-                return cand
-        for cand in JSON_CONTAINERS:
-            if hasattr(Model, cand):
-                return cand
-        return None
+        names = [cand for cand in JSON_CONTAINERS if cand in fields]
+        return names  # may be empty; then we’ll scan all dict-like attrs dynamically
 
-    def _get_attr_or_json(self, row, keys, json_name):
-        # direct attribute
+    def _iter_possible_blobs(self, row, preferred_names):
+        # Yield any dict-like blobs that could carry data keys.
+        # 1) preferred containers first
+        for name in preferred_names:
+            if hasattr(row, name):
+                blob = getattr(row, name)
+                if isinstance(blob, dict):
+                    yield blob
+        # 2) scan all attributes that look like dicts (robust for CustomObject)
+        for f in row._meta.get_fields():
+            nm = getattr(f, "name", None)
+            if not nm or nm in preferred_names:  # already tried
+                continue
+            try:
+                val = getattr(row, nm, None)
+            except Exception:
+                continue
+            if isinstance(val, dict):
+                yield val
+
+    def _get_attr_or_json(self, row, keys, preferred_names):
+        # Try direct attributes first
         for k in keys:
             if hasattr(row, k):
                 val = getattr(row, k, None)
                 if val not in (None, ""):
                     return val
-        # JSON container
-        if json_name and hasattr(row, json_name):
-            blob = getattr(row, json_name)
-            if isinstance(blob, dict):
-                for k in keys:
-                    if k in blob and blob[k] not in (None, ""):
-                        return blob[k]
+        # Then any JSON-like blobs
+        for blob in self._iter_possible_blobs(row, preferred_names):
+            for k in keys:
+                if k in blob and blob[k] not in (None, ""):
+                    return blob[k]
         return None
 
-    # ---------- platform extraction ----------
-    def _platform_pks_from_row(self, row, json_name):
+    # --------- platform extraction ----------
+    def _platform_pks_from_row(self, row, preferred_names):
         pks = set()
 
-        # Relations (FK/M2M) named platform/platforms
-        for fname in PLATFORM_FIELD_NAMES:
+        # 1) relations named platform/platforms (FK/M2M)
+        for fname in ("platform", "platforms"):
             if hasattr(row, fname):
                 rel = getattr(row, fname)
-                # FK-like
-                if hasattr(rel, "pk"):
-                    if rel.pk:
-                        pks.add(rel.pk)
-                # M2M manager
-                elif hasattr(rel, "all"):
+                if hasattr(rel, "pk"):  # FK
+                    if rel.pk: pks.add(rel.pk)
+                elif hasattr(rel, "all"):  # M2M
                     try:
                         for p in rel.all():
                             pk = getattr(p, "pk", None)
-                            if pk:
-                                pks.add(pk)
+                            if pk: pks.add(pk)
                     except Exception:
                         pass
 
-        # JSON fallbacks: resolve id/name/slug → Platform pk
-        if json_name and hasattr(row, json_name):
-            blob = getattr(row, json_name)
-            if isinstance(blob, dict):
-                for key in PLATFORM_JSON_KEYS:
-                    if key not in blob:
-                        continue
-                    val = blob.get(key)
+        # 2) JSON blobs, resolve id/name/slug → Platform pk
+        def add_by_name_or_slug(s):
+            try:
+                plat = Platform.objects.filter(name__iexact=s).first() or Platform.objects.filter(slug__iexact=s).first()
+                if plat:
+                    pks.add(plat.pk)
+            except Exception:
+                pass
 
-                    def add_by_name_or_slug(s):
-                        try:
-                            plat = Platform.objects.filter(name__iexact=s).first() or Platform.objects.filter(slug__iexact=s).first()
-                            if plat:
-                                pks.add(plat.pk)
+        for blob in self._iter_possible_blobs(row, preferred_names):
+            for key in PLATFORM_JSON_KEYS:
+                if key not in blob:
+                    continue
+                val = blob.get(key)
+                if isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, int):
+                            pks.add(item)
+                        elif isinstance(item, str):
+                            try: pks.add(int(item))
+                            except Exception: add_by_name_or_slug(item)
+                        elif isinstance(item, dict):
+                            pid = item.get("id") or item.get("pk")
+                            if pid is not None:
+                                try: pks.add(int(pid))
+                                except Exception:
+                                    for nk in ("name", "slug", "label", "display"):
+                                        if nk in item and item[nk]:
+                                            add_by_name_or_slug(str(item[nk]))
+                                            break
+                elif isinstance(val, int):
+                    pks.add(val)
+                elif isinstance(val, str):
+                    try: pks.add(int(val))
+                    except Exception: add_by_name_or_slug(val)
+                elif isinstance(val, dict):
+                    pid = val.get("id") or val.get("pk")
+                    if pid is not None:
+                        try: pks.add(int(pid))
                         except Exception:
-                            pass
-
-                    if isinstance(val, list):
-                        for item in val:
-                            if isinstance(item, int):
-                                pks.add(item)
-                            elif isinstance(item, str):
-                                try: pks.add(int(item))
-                                except Exception: add_by_name_or_slug(item)
-                            elif isinstance(item, dict):
-                                pid = item.get("id") or item.get("pk")
-                                if pid is not None:
-                                    try: pks.add(int(pid))
-                                    except Exception:
-                                        for nk in ("name", "slug", "label"):
-                                            if nk in item and item[nk]:
-                                                add_by_name_or_slug(str(item[nk]))
-                                                break
-                    elif isinstance(val, int):
-                        pks.add(val)
-                    elif isinstance(val, str):
-                        try: pks.add(int(val))
-                        except Exception: add_by_name_or_slug(val)
-                    elif isinstance(val, dict):
-                        pid = val.get("id") or val.get("pk")
-                        if pid is not None:
-                            try: pks.add(int(pid))
-                            except Exception:
-                                for nk in ("name", "slug", "label"):
-                                    if nk in val and val[nk]:
-                                        add_by_name_or_slug(str(val[nk]))
-                                        break
+                            for nk in ("name", "slug", "label", "display"):
+                                if nk in val and val[nk]:
+                                    add_by_name_or_slug(str(val[nk]))
+                                    break
 
         return list(pks)
 
-    # ---------- catalog model discovery ----------
-    def _model_sample_score(self, Model, debug=False):
-        """
-        Return a tuple (score, stats_dict)
-        Score prioritizes: having names+ids, and producing platform links.
-        """
-        json_name = self._json_container_name(Model)
-        try:
-            qs = Model.objects.all()[:200]
-        except Exception:
-            return (-1, {"model": Model, "json": json_name, "valid": 0, "plat_rows": 0, "plats": 0})
-
-        valid = 0
-        plat_rows = 0
-        plat_total = 0
-        for row in qs:
-            nm = self._norm_str(self._get_attr_or_json(row, NAME_KEYS, json_name))
-            tid = self._get_attr_or_json(row, ID_KEYS, json_name)
-            if nm and tid not in (None, ""):
-                valid += 1
-            pks = self._platform_pks_from_row(row, json_name)
-            if pks:
-                plat_rows += 1
-                plat_total += len(pks)
-
-        # score: platform rows are king, then valid name+id rows
-        score = (plat_rows * 1000) + (plat_total * 10) + valid
-        if debug:
-            self.log_info(f"[COT-scan] {Model._meta.label}: valid={valid}, plat_rows={plat_rows}, plat_total={plat_total}, json='{json_name}'")
-        return (score, {"model": Model, "json": json_name, "valid": valid, "plat_rows": plat_rows, "plats": plat_total})
-
+    # --------- catalog discovery & load ----------
     def _pick_catalog_model(self, debug=False):
+        # Prefer the plugin’s entries model; in your instance this is likely netbox_custom_objects.CustomObject
         best = None
         best_score = -1
-        best_stats = None
+        best_json_names = []
 
         for Model in apps.get_models():
             if Model._meta.app_label.lower() != "netbox_custom_objects":
                 continue
-            name = Model.__name__.lower()
-            if "customobjecttype" in name:
+            if "customobjecttype" in Model.__name__.lower():
                 continue  # not entries
-            score, stats = self._model_sample_score(Model, debug=debug)
+
+            json_names = self._json_container_names(Model)
+            try:
+                sample = Model.objects.all()[:200]
+            except Exception:
+                continue
+
+            valid = 0
+            plat_rows = 0
+            plat_total = 0
+            for row in sample:
+                nm = self._norm_str(self._get_attr_or_json(row, NAME_KEYS, json_names))
+                tid = self._get_attr_or_json(row, ID_KEYS, json_names)
+                if nm and tid not in (None, ""):
+                    valid += 1
+                pks = self._platform_pks_from_row(row, json_names)
+                if pks:
+                    plat_rows += 1
+                    plat_total += len(pks)
+
+            # score: platform rows dominate; then valid name+id rows
+            score = (plat_rows * 1000) + (plat_total * 10) + valid
+            if debug:
+                self.log_info(f"[COT-scan] {Model._meta.label}: valid={valid}, plat_rows={plat_rows}, plat_total={plat_total}, json_pref={json_names or 'auto-detect'}")
             if score > best_score:
-                best, best_score, best_stats = stats["model"], score, stats
+                best, best_score, best_json_names = Model, score, json_names
 
         if debug and best:
-            self.log_success(f"[COT-pick] {best._meta.label} -> score={best_score}, valid={best_stats['valid']}, plat_rows={best_stats['plat_rows']}, json='{best_stats['json']}'")
-        return best, (best_stats["json"] if best_stats else None)
+            self.log_success(f"[COT-pick] {best._meta.label} (json_pref={best_json_names or 'auto-detect'})")
+        return best, best_json_names
 
     def _load_catalog(self, debug=False):
-        """
-        Build:
-          - name_to_id: lower(name) -> template_id
-          - name_to_iface: lower(name) -> template_interface_id (may be int/str/None)
-          - by_platform: platform_pk -> (template_name, template_id, template_interface_id)
-        Chooses the model that actually yields platform mappings; falls back to names only if needed.
-        """
-        Entry, json_name = self._pick_catalog_model(debug=debug)
+        Entry, json_names = self._pick_catalog_model(debug=debug)
         if not Entry:
             raise RuntimeError("Could not locate a Custom Objects entries model with usable template data.")
 
@@ -248,25 +243,24 @@ class ZabbixConfigFromCOT(Script):
 
         for row in Entry.objects.all():
             scanned += 1
-            nm = self._norm_str(self._get_attr_or_json(row, NAME_KEYS, json_name))
+            nm = self._norm_str(self._get_attr_or_json(row, NAME_KEYS, json_names))
             if not nm:
                 continue
             key = nm.lower()
 
-            tid = self._get_attr_or_json(row, ID_KEYS, json_name)
-            # keep as str if non-numeric; try cast for convenience
+            tid = self._get_attr_or_json(row, ID_KEYS, json_names)
             try: tid = int(tid)
             except Exception: pass
             name_to_id[key] = tid
 
-            iid = self._get_attr_or_json(row, IFACE_KEYS, json_name)
+            iid = self._get_attr_or_json(row, IFACE_KEYS, json_names)
             if iid not in (None, ""):
                 has_iface_any = True
                 try: iid = int(iid)
                 except Exception: pass
             name_to_iface[key] = iid
 
-            pks = self._platform_pks_from_row(row, json_name)
+            pks = self._platform_pks_from_row(row, json_names)
             if pks:
                 plat_rows += 1
                 for pk in pks:
@@ -274,7 +268,6 @@ class ZabbixConfigFromCOT(Script):
                         by_platform[pk] = (nm, tid, iid)
 
         iface_map = name_to_iface if has_iface_any else None
-
         self.log_info(
             f"COT catalog loaded from {Entry._meta.label} "
             f"(rows_scanned={scanned}, mapped_names={len(name_to_id)}, "
@@ -282,7 +275,7 @@ class ZabbixConfigFromCOT(Script):
         )
         return name_to_id, iface_map, by_platform
 
-    # ---------- SLA / readiness ----------
+    # --------- SLA / readiness ----------
     def _ensure_sla(self, obj, cf, counters, overwrite=False):
         cur = self._norm_str(cf.get("sla_report_code"))
         if cur and not overwrite:
@@ -315,7 +308,7 @@ class ZabbixConfigFromCOT(Script):
         cf_after["monitoring_status"] = "In-progress" if meets else cf_after.get("monitoring_status") or "Missing Required Fields"
         return meets, missing, cf_after
 
-    # ---------- parsing ----------
+    # --------- parsing ----------
     def _parse_extras(self, v):
         if v is None: return []
         if isinstance(v, (list, tuple)):
@@ -334,7 +327,7 @@ class ZabbixConfigFromCOT(Script):
         s = str(v).strip()
         return [s] if s else []
 
-    # ---------- query streams ----------
+    # --------- query streams ----------
     def _devices(self, site):
         qs = Device.objects.all().select_related("platform", "primary_ip4", "site")
         if site: qs = qs.filter(site=site)
@@ -343,7 +336,7 @@ class ZabbixConfigFromCOT(Script):
     def _vms(self):
         return VirtualMachine.objects.all().select_related("platform", "primary_ip4", "cluster", "tenant").iterator()
 
-    # ---------- main ----------
+    # --------- main ----------
     def run(self, data, commit):
         commit = (commit and not data.get("dry_run", False))
         overwrite = data.get("overwrite_all_mapped_fields", False)
@@ -362,7 +355,7 @@ class ZabbixConfigFromCOT(Script):
         limit_site_obj  = data.get("limit_site")
         limit_site_id   = int(limit_site_obj.id) if limit_site_obj else None
 
-        # Load catalog (robust)
+        # Load catalog
         try:
             name_to_id, name_to_iface, by_platform = self._load_catalog(debug=debug)
         except Exception as e:
@@ -401,7 +394,7 @@ class ZabbixConfigFromCOT(Script):
                         cf["monitoring_status"] = "Missing Required Fields"
                         if commit: obj.custom_field_data = cf; obj.save()
                         step1_skips += 1
-                        meets, missing, cf_after = self._ready_eval(obj, cf)
+                        meets, _, cf_after = self._ready_eval(obj, cf)
                         if commit: obj.custom_field_data = cf_after; obj.save()
                         status_true += 1 if meets else 0
                         status_false += 0 if meets else 1
@@ -425,13 +418,13 @@ class ZabbixConfigFromCOT(Script):
                         cf["monitoring_status"] = "Missing Required Fields"
                         if commit: obj.custom_field_data = cf; obj.save()
                         step2_skips += 1
-                        meets, missing, cf_after = self._ready_eval(obj, cf)
+                        meets, _, cf_after = self._ready_eval(obj, cf)
                         if commit: obj.custom_field_data = cf_after; obj.save()
                         status_true += 1 if meets else 0
                         status_false += 0 if meets else 1
                         continue
 
-                    # Step 3.0: Template sync
+                    # Step 3.0: Template sync (primary by platform)
                     plat_pk = getattr(getattr(obj, "platform", None), "pk", None)
                     cur_name = self._norm_str(cf.get("zabbix_template_name"))
                     cur_int  = cf.get("zabbix_template_int_id")
@@ -498,12 +491,12 @@ class ZabbixConfigFromCOT(Script):
                         ids_skipped += 1
 
                     # Step 3.1: SLA
-                    cf, added = self._ensure_sla(obj, cf, sla_c, overwrite=overwrite)
+                    cf, added = self._ensure_sla(obj, cf, {"added":0,"no_role":0,"role_no_code":0}, overwrite=overwrite)
                     if added and commit:
                         obj.custom_field_data = cf; obj.save()
 
                     # Final readiness
-                    meets, missing, cf_after = self._ready_eval(obj, cf)
+                    meets, _, cf_after = self._ready_eval(obj, cf)
                     if commit: obj.custom_field_data = cf_after; obj.save()
                     if meets: status_true += 1
                     else:     status_false += 1
@@ -513,7 +506,6 @@ class ZabbixConfigFromCOT(Script):
                 transaction.set_rollback(True)
 
         # Summary
-        self.log_info(f"SLA: added={sla_c['added']}, no_role={sla_c['no_role']}, role_no_code={sla_c['role_no_code']}")
         self.log_info(f"Template: primary updates={tmpl_primary_updates}, primary skips={tmpl_primary_skips}")
         self.log_info(f"Template IDs: updated={ids_updated}, skipped={ids_skipped}")
         self.log_info(f"Status: True={status_true}, False={status_false}; Checked: devices={devices_checked}, vms={vms_checked}; Skipped Step1={step1_skips}, Step2={step2_skips}")
