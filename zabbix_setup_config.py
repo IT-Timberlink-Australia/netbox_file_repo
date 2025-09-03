@@ -1,22 +1,31 @@
 # NetBox Script: Prestage Zabbix fields from Custom Objects (zabbix-template-list)
-# Super-tolerant catalog reader: supports FK/int/string linking and many JSON shapes.
+# Reads Custom Object *field values* (not just row attributes/JSON), so it works
+# with the netbox-custom-objects plugin even when fields are defined dynamically.
 
 from dcim.models import Device, Site, Platform
 from virtualization.models import VirtualMachine
 from extras.scripts import Script, BooleanVar, ObjectVar
 from django.apps import apps
 from django.db import transaction
-from django.db.models import ManyToManyField, ForeignKey
-import json
+from django.db.models import ForeignKey, ManyToManyField
+import re
 
 COT_TYPE_SELECTOR = "zabbix-template-list"
 
-NAME_KEYS   = ("template_name", "name", "template")
-ID_KEYS     = ("template_id", "id", "zabbix_template_id")
-IFACE_KEYS  = ("template_interface_id", "iface_id", "interface_id")
-PLATFORM_JSON_KEYS = ("platforms", "platform_ids", "platform_slugs", "platform_names")
+# Normalize strings to slugs for matching field names robustly
+def _slug(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
 
-JSON_CONTAINERS = ("data", "payload", "attributes", "values", "field_values", "properties")
+# Candidate keys we care about (slugged)
+NAME_KEYS   = {_slug(x) for x in ("template_name", "name", "template")}
+ID_KEYS     = {_slug(x) for x in ("template_id", "zabbix_template_id")}
+IFACE_KEYS  = {_slug(x) for x in ("template_interface_id", "iface_id", "interface_id", "interface")}
+PLATFORM_KEYS = {_slug(x) for x in ("platform", "platforms")}
+
+IFACE_MAP = {"agent": 1, "snmp": 2, "ipmi": 3, "jmx": 4}
 
 
 class PrestageZabbixFromCOT(Script):
@@ -29,37 +38,42 @@ class PrestageZabbixFromCOT(Script):
     include_vms     = BooleanVar(description="Include Virtual Machines", default=False)
     limit_site      = ObjectVar(description="Soft limit by Site", required=False, model=Site)
     overwrite       = BooleanVar(description="Overwrite existing values", default=False)
-    debug_catalog   = BooleanVar(description="Verbose catalog discovery logs", default=True)  # default True for now
+    debug_catalog   = BooleanVar(description="Verbose catalog discovery logs", default=True)
 
-    # ---------- tiny helpers ----------
-    def _norm_str(self, v): return (str(v).strip() if v is not None else "")
-    def _is_true(self, v):  return str(v).lower() in {"1", "true", "yes", "on"}
-    def _cf(self, obj):     return dict(getattr(obj, "custom_field_data", {}) or {})
-    def _desc(self, obj):   return self._norm_str(getattr(obj, "description", ""))
-    def _role(self, obj):   return getattr(obj, "device_role", None) or getattr(obj, "role", None)
+    # -------- tiny helpers --------
+    def _norm(self, v): return (str(v).strip() if v is not None else "")
+    def _is_true(self, v): return str(v).lower() in {"1","true","yes","on"}
+    def _cf(self, obj): return dict(getattr(obj, "custom_field_data", {}) or {})
     def _has_primary_ip(self, obj):
         return bool(getattr(obj, "primary_ip4", None) or getattr(obj, "primary_ip6", None))
+    def _role(self, obj): return getattr(obj, "device_role", None) or getattr(obj, "role", None)
 
-    # ---------- plugin model discovery ----------
-    def _get_cot_models(self):
+    # -------- plugin model discovery --------
+    def _get_models(self):
         app_label = "netbox_custom_objects"
-        Type = Row = None
-        for Model in apps.get_models():
-            if Model._meta.app_label.lower() != app_label:
+        Type = Row = Field = Value = None
+        for M in apps.get_models():
+            if M._meta.app_label.lower() != app_label:
                 continue
-            nm = Model.__name__.lower()
-            if "customobjecttype" in nm and Type is None:
-                Type = Model
-            elif "customobject" in nm and "type" not in nm and Row is None:
-                Row = Model
+            n = M.__name__.lower()
+            if "customobjecttype" in n and Type is None:
+                Type = M
+            elif n == "customobject" and Row is None:
+                Row = M
+            elif "customobjectfield" in n and "value" not in n and Field is None:
+                Field = M
+            elif "customobjectfield" in n and "value" in n and Value is None:
+                Value = M
+            elif "customobjectvalue" in n and Value is None:
+                Value = M
         if not (Type and Row):
-            raise RuntimeError("Could not locate plugin models (CustomObjectType/CustomObject).")
-        return Type, Row
+            raise RuntimeError("Could not locate CustomObjectType/CustomObject models.")
+        return Type, Row, Field, Value  # Field/Value may be None; we’ll handle that
 
-    def _resolve_type_instance(self, Type, selector, debug=False):
+    def _resolve_type(self, Type, selector, debug=False):
         fields = {f.name for f in Type._meta.get_fields()}
         for key in ("slug__iexact", "name__iexact", "label__iexact"):
-            base = key.split("__", 1)[0]
+            base = key.split("__",1)[0]
             if base in fields:
                 obj = Type.objects.filter(**{key: selector}).first()
                 if obj:
@@ -68,290 +82,265 @@ class PrestageZabbixFromCOT(Script):
         any_type = Type.objects.first()
         if not any_type:
             raise RuntimeError("No CustomObjectType instances found.")
-        self.log_warning(f"[COT] Could not match type by slug/name/label='{selector}'. "
-                         f"Using first type id={any_type.pk}, name={getattr(any_type,'name',None)}")
+        self.log_warning(f"[COT] Could not match by slug/name/label='{selector}'. Using first: id={any_type.pk}")
         return any_type
 
-    def _row_queryset_for_type(self, RowModel, type_obj, selector, debug=False):
-        fields = {f.name: f for f in RowModel._meta.get_fields()}
-
-        # 1) Real FK
+    def _rows_for_type(self, Row, TypeObj, selector, debug=False):
+        # Try typical FKs or *_id fields; else string markers; else all
+        fields = {f.name: f for f in Row._meta.get_fields()}
+        # FK
         for name, f in fields.items():
-            if isinstance(f, ForeignKey) and f.remote_field and f.remote_field.model == type_obj.__class__:
-                qs = RowModel.objects.filter(**{name: type_obj})
+            if isinstance(f, ForeignKey) and f.remote_field and f.remote_field.model == TypeObj.__class__:
+                qs = Row.objects.filter(**{name: TypeObj})
                 if debug: self.log_info(f"[COT] Rows via FK '{name}': count={qs.count()}")
                 return qs
-
-        # 2) Integer *_id
-        for id_field in ("custom_object_type_id", "object_type_id", "type_id"):
-            if id_field in fields or hasattr(RowModel, id_field):
+        # *_id
+        for idf in ("custom_object_type_id", "object_type_id", "type_id"):
+            if idf in fields or hasattr(Row, idf):
                 try:
-                    qs = RowModel.objects.filter(**{id_field: type_obj.pk})
-                    if debug: self.log_info(f"[COT] Rows via integer field '{id_field}': count={qs.count()}")
-                    if qs.exists(): return qs
-                except Exception as e:
-                    if debug: self.log_warning(f"[COT] Integer filter on '{id_field}' raised: {e}")
-
-        # 3) String marker
-        for sfield in ("type", "group_name", "label", "name"):
-            if sfield in fields or hasattr(RowModel, sfield):
+                    qs = Row.objects.filter(**{idf: TypeObj.pk})
+                    if qs.exists():
+                        if debug: self.log_info(f"[COT] Rows via int '{idf}': count={qs.count()}")
+                        return qs
+                except Exception:
+                    pass
+        # string marker
+        for sfield in ("type","group_name","label","name"):
+            if sfield in fields or hasattr(Row, sfield):
                 try:
-                    qs = RowModel.objects.filter(**{f"{sfield}__iexact": selector})
-                    if debug: self.log_info(f"[COT] Rows via string marker '{sfield}': count={qs.count()}")
-                    if qs.exists(): return qs
-                except Exception as e:
-                    if debug: self.log_warning(f"[COT] String filter on '{sfield}' raised: {e}")
-
-        # 4) fallback
-        qs = RowModel.objects.all()
-        self.log_warning(f"[COT] Could not narrow rows by FK/id/string. Scanning ALL rows (count={qs.count()}).")
+                    qs = Row.objects.filter(**{f"{sfield}__iexact": selector})
+                    if qs.exists():
+                        if debug: self.log_info(f"[COT] Rows via marker '{sfield}': count={qs.count()}")
+                        return qs
+                except Exception:
+                    pass
+        qs = Row.objects.all()
+        if debug: self.log_warning(f"[COT] Scanning ALL rows (count={qs.count()}).")
         return qs
 
-    # ---------- blob extraction ----------
-    def _json_container_names(self, Model):
-        fields = {f.name for f in Model._meta.get_fields() if hasattr(f, "attname")}
-        return [n for n in JSON_CONTAINERS if n in fields]
+    # -------- value extraction (key bit) --------
+    def _field_defs_for_type(self, Field, TypeObj):
+        # Find definitions for this type; collect {slug -> FieldDef obj}
+        defs = {}
+        if not Field:
+            return defs
+        # Candidate FK names pointing Field -> Type
+        for rel_name in ("custom_object_type", "object_type", "type"):
+            if hasattr(Field, "_meta") and rel_name in {f.name for f in Field._meta.get_fields()}:
+                for fd in Field.objects.filter(**{rel_name: TypeObj}):
+                    slug = _slug(getattr(fd, "name", None) or getattr(fd, "label", None))
+                    if slug:
+                        defs[slug] = fd
+                break
+        return defs
 
-    def _maybe_parse_json(self, val):
-        if isinstance(val, str):
-            s = val.strip()
-            if s and (s[0] in "{[" and s[-1] in "}]"):
-                try:
-                    return json.loads(s)
-                except Exception:
-                    return None
-        return None
-
-    def _kv_pairs_from_blob(self, blob):
+    def _values_for_row(self, row, defs, ValueModel, debug=False):
         """
-        Yield (key, value) pairs from a variety of shapes:
-        - direct dict {k:v}
-        - {'field_values': {...}}, {'properties': {...}}
-        - {'fields': [{'name': 'template_name', 'value': '...'}]}
+        Build a dict of slug->value for a row by walking reverse relations to 'value' objects.
+        Supports multi-select: returns lists. Related Platform objects resolved to PKs.
         """
-        if not isinstance(blob, dict):
-            return
-
-        # Direct mapping
-        for k, v in list(blob.items()):
-            yield k, v
-
-        # Nested mapping containers
-        for inner in ("field_values", "properties"):
-            m = blob.get(inner)
-            if isinstance(m, dict):
-                for k, v in m.items():
-                    yield k, v
-
-        # Field list
-        fields_list = blob.get("fields") or blob.get("Fields")
-        if isinstance(fields_list, (list, tuple)):
-            for item in fields_list:
-                if isinstance(item, dict):
-                    k = item.get("name") or item.get("key") or item.get("field") or item.get("slug")
-                    v = item.get("value")
-                    if k:
-                        yield k, v
-
-    def _iter_possible_blobs(self, row, preferred):
-        # Known containers first
-        for name in preferred:
-            if hasattr(row, name):
-                raw = getattr(row, name)
-                cand = raw
-                if isinstance(raw, str):
-                    parsed = self._maybe_parse_json(raw)
-                    if parsed is not None:
-                        cand = parsed
-                if isinstance(cand, dict):
-                    yield cand
-
-        # Any dict-like attributes or JSON strings
-        for f in row._meta.get_fields():
-            nm = getattr(f, "name", None)
-            if not nm or nm in preferred:
-                continue
+        out = {}
+        # Try common reverse relation names first
+        candidates = []
+        for rel in row._meta.get_fields():
+            # look for reverse FK managers (one-to-many)
             try:
-                raw = getattr(row, nm, None)
+                acc = getattr(rel, "get_accessor_name", None)
+                if not acc:
+                    continue
+                acc = acc()
+                mgr = getattr(row, acc, None)
+                if hasattr(mgr, "all"):
+                    candidates.append((rel, mgr))
             except Exception:
                 continue
-            cand = raw
-            if isinstance(raw, str):
-                parsed = self._maybe_parse_json(raw)
-                if parsed is not None:
-                    cand = parsed
-            if isinstance(cand, dict):
-                yield cand
 
-    def _get_field_from_row(self, row, keys, preferred):
-        # Direct attributes
-        for k in keys:
-            if hasattr(row, k):
-                val = getattr(row, k)
-                if val not in (None, ""):
-                    return val
+        for rel, mgr in candidates:
+            try:
+                for val in mgr.all():
+                    # Identify link to field def
+                    fd = getattr(val, "custom_object_field", None) or getattr(val, "field", None)
+                    if not fd:
+                        continue
+                    key = _slug(getattr(fd, "name", None) or getattr(fd, "label", None))
+                    if not key:
+                        continue
 
-        # From blobs
-        for blob in self._iter_possible_blobs(row, preferred):
-            # Flat dict or nested shapes
-            for k, v in self._kv_pairs_from_blob(blob):
-                if k in keys and v not in (None, ""):
-                    return v
-        return None
+                    # Extract a value in a very forgiving way
+                    v = None
+                    # direct 'value' attr
+                    for attr in ("value", "raw_value", "serialized_value", "string", "text", "number", "boolean", "json", "data"):
+                        if hasattr(val, attr):
+                            v = getattr(val, attr)
+                            if v not in (None, ""):
+                                break
+                    # related single object
+                    if v in (None, ""):
+                        for attr in ("related_object", "object", "content_object"):
+                            if hasattr(val, attr):
+                                v = getattr(val, attr)
+                                if v is not None:
+                                    break
+                    # related many objects
+                    if v in (None, ""):
+                        for attr in ("related_objects",):
+                            if hasattr(val, attr):
+                                relmgr = getattr(val, attr)
+                                if hasattr(relmgr, "all"):
+                                    v = list(relmgr.all())
+                                    break
 
-    def _get_platform_pks_from_row(self, row, preferred):
-        # M2M?
-        try:
-            fld = row._meta.get_field("platforms")
-            if isinstance(fld, ManyToManyField) and fld.remote_field.model is Platform:
-                return list(getattr(row, "platforms").values_list("pk", flat=True))
-        except Exception:
-            pass
+                    # Normalize Platforms to PKs; lists to list of PKs/strings
+                    def norm_one(x):
+                        if x is None:
+                            return None
+                        if isinstance(x, Platform):
+                            return x.pk
+                        return x
 
-        pks = set()
+                    if isinstance(v, list):
+                        v = [norm_one(x) for x in v if x is not None]
+                    else:
+                        v = norm_one(v)
 
-        def add_by_name_or_slug(val):
-            if not val:
-                return
-            s = str(val).strip()
-            if not s:
-                return
-            hit = Platform.objects.filter(slug__iexact=s).first() \
-               or Platform.objects.filter(name__iexact=s).first()
-            if hit:
-                pks.add(hit.pk)
+                    # Collect (merge lists if repeated)
+                    if key in out and isinstance(out[key], list):
+                        out[key].append(v)
+                    elif key in out and isinstance(v, list):
+                        out[key] = out[key] + v
+                    elif key in out:
+                        out[key] = [out[key], v]
+                    else:
+                        out[key] = v
+            except Exception:
+                continue
 
-        # Blobs
-        for blob in self._iter_possible_blobs(row, preferred):
-            # First, check for a straight mapping of our known keys
-            for k, v in self._kv_pairs_from_blob(blob):
-                if k not in PLATFORM_JSON_KEYS:
-                    continue
-                val = v
-                if isinstance(val, (list, tuple, set)):
-                    for item in val:
-                        if isinstance(item, int):
-                            pks.add(item)
-                        elif isinstance(item, str):
-                            try: pks.add(int(item))
-                            except Exception: add_by_name_or_slug(item)
-                        elif isinstance(item, dict):
-                            pid = item.get("id") or item.get("pk")
-                            if pid is not None:
-                                try: pks.add(int(pid))
-                                except Exception: add_by_name_or_slug(item.get("slug") or item.get("name"))
-                elif isinstance(val, int):
-                    pks.add(val)
-                elif isinstance(val, str):
-                    try: pks.add(int(val))
-                    except Exception: add_by_name_or_slug(val)
-                elif isinstance(val, dict):
-                    pid = val.get("id") or val.get("pk")
-                    if pid is not None:
-                        try: pks.add(int(pid))
-                        except Exception: add_by_name_or_slug(val.get("slug") or val.get("name"))
+        if debug:
+            self.log_info(f"[COT] Row discovered fields: {sorted(out.keys())}")
+        return out
 
-        return list(pks)
-
-    # ---------- catalog load ----------
-    def _load_template_catalog(self, debug=False):
-        Type, RowModel = self._get_cot_models()
-        preferred = self._json_container_names(RowModel)
-
-        type_obj = self._resolve_type_instance(Type, COT_TYPE_SELECTOR, debug=debug)
-        rows_qs = self._row_queryset_for_type(RowModel, type_obj, COT_TYPE_SELECTOR, debug=debug)
+    # -------- catalog load --------
+    def _load_catalog(self, debug=False):
+        Type, Row, Field, Value = self._get_models()
+        type_obj = self._resolve_type(Type, COT_TYPE_SELECTOR, debug=debug)
+        rows_qs = self._rows_for_type(Row, type_obj, COT_TYPE_SELECTOR, debug=debug)
+        defs = self._field_defs_for_type(Field, type_obj)
 
         name_to_id = {}
         name_to_iface = {}
         by_platform = {}
 
         rows = list(rows_qs)
-        # Debug: show keys of first row
-        if debug and rows:
-            row0 = rows[0]
-            keys = []
-            for blob in self._iter_possible_blobs(row0, preferred):
-                for k, _ in self._kv_pairs_from_blob(blob):
-                    if k not in keys:
-                        keys.append(k)
-            self.log_info(f"[COT] First row discovered keys: {keys}")
+        if debug:
+            self.log_info(f"[COT] Scanning rows: {len(rows)}; field defs={sorted(defs.keys())}")
 
         for row in rows:
-            name = self._get_field_from_row(row, NAME_KEYS, preferred)
-            tid  = self._get_field_from_row(row, ID_KEYS, preferred)
-            ifid = self._get_field_from_row(row, IFACE_KEYS, preferred)
-
-            name = self._norm_str(name)
-            if not name:
+            vals = self._values_for_row(row, defs, Value, debug=debug)
+            # Resolve template name
+            tname = None
+            for k in NAME_KEYS:
+                if k in vals and self._norm(vals[k]):
+                    tname = self._norm(vals[k])
+                    break
+            if not tname:
                 continue
-            try: tid = int(tid)
-            except Exception: tid = None
-            try: ifid = int(ifid)
-            except Exception: ifid = None
 
-            lname = name.lower()
-            if tid is not None:
-                name_to_id[lname] = tid
-            if ifid is not None:
-                name_to_iface[lname] = ifid
+            # Resolve template id
+            tid = None
+            for k in ID_KEYS:
+                if k in vals and self._norm(vals[k]):
+                    try:
+                        tid = int(self._norm(vals[k]))
+                    except Exception:
+                        pass
+                    break
+            if tid is None:
+                continue
 
-            plat_pks = self._get_platform_pks_from_row(row, preferred)
+            # Resolve interface id (string or int)
+            tif = None
+            for k in IFACE_KEYS:
+                if k in vals and self._norm(vals[k]):
+                    raw = self._norm(vals[k]).lower()
+                    if raw.isdigit():
+                        tif = int(raw)
+                    else:
+                        tif = IFACE_MAP.get(raw)
+                    break
+
+            # Resolve platforms → PK list
+            plat_pks = []
+            # field may be 'platform' or 'platforms', value could be single, list, pk, slug, name, or Platform
+            for k in PLATFORM_KEYS:
+                if k in vals and vals[k] not in (None, "", []):
+                    v = vals[k]
+                    if not isinstance(v, list):
+                        v = [v]
+                    for item in v:
+                        if isinstance(item, int):
+                            plat_pks.append(item)
+                        elif isinstance(item, Platform):
+                            plat_pks.append(item.pk)
+                        else:
+                            s = self._norm(item)
+                            if s:
+                                hit = Platform.objects.filter(slug__iexact=s).first() or \
+                                      Platform.objects.filter(name__iexact=s).first()
+                                if hit:
+                                    plat_pks.append(hit.pk)
+
+            lname = tname.lower()
+            name_to_id[lname] = tid
+            if tif is not None:
+                name_to_iface[lname] = tif
             for pk in plat_pks:
-                if pk not in by_platform and tid is not None:
-                    by_platform[pk] = (name, tid, ifid)
+                if pk not in by_platform:
+                    by_platform[pk] = (tname, tid, tif)
 
         if debug:
-            self.log_info(f"[COT] Catalog rows_scanned={len(rows)}; name_to_id={len(name_to_id)}; "
-                          f"platform_mappings={len(by_platform)}")
+            self.log_info(f"[COT] Catalog built: names={len(name_to_id)}, platform_mappings={len(by_platform)}")
         return name_to_id, (name_to_iface or None), by_platform
 
-    # ---------- SLA + readiness ----------
-    def _ensure_sla(self, obj, cf, counters, overwrite=False):
-        cur = self._norm_str(cf.get("sla_report_code"))
+    # -------- SLA / readiness --------
+    def _ensure_sla(self, obj, cf, overwrite=False):
+        cur = self._norm(cf.get("sla_report_code"))
         if cur and not overwrite:
             return cf, False
         role = self._role(obj)
         if not role:
-            counters["no_role"] = counters.get("no_role", 0) + 1
             return cf, False
-        role_cf = dict(getattr(role, "custom_field_data", {}) or {})
-        code = self._norm_str(role_cf.get("sla_report_code"))
+        rcf = dict(getattr(role, "custom_field_data", {}) or {})
+        code = self._norm(rcf.get("sla_report_code"))
         if not code:
-            counters["role_no_code"] = counters.get("role_no_code", 0) + 1
             return cf, False
         cf["sla_report_code"] = code
-        counters["added"] = counters.get("added", 0) + 1
         return cf, True
 
     def _ready_eval(self, obj, cf_after):
         missing = []
-        status = self._norm_str(getattr(obj, "status", ""))
-        if status != "active": missing.append('status="active"')
+        if self._norm(getattr(obj, "status", "")) != "active": missing.append('status="active"')
         if not self._has_primary_ip(obj): missing.append("primary IP set")
         if getattr(obj, "platform_id", None) is None: missing.append("platform set")
         if not self._is_true(cf_after.get("mon_req")): missing.append("mon_req=True")
-        if not self._norm_str(cf_after.get("zabbix_template_name")): missing.append("zabbix_template set")
-        if not self._norm_str(cf_after.get("environment")): missing.append("environment set")
-        if not self._desc(obj): missing.append("description set")
-        if not self._norm_str(cf_after.get("sla_report_code")): missing.append("SLA code set")
-
+        if not self._norm(cf_after.get("zabbix_template_name")): missing.append("zabbix_template set")
+        if not self._norm(cf_after.get("environment")): missing.append("environment set")
+        if not self._norm(cf_after.get("sla_report_code")): missing.append("SLA code set")
         if missing:
             cf_after["monitoring_status"] = f"Missing Required Fields: {', '.join(missing)}"
-            return False, missing, cf_after
+            return False, cf_after
         cf_after["monitoring_status"] = "Ready"
-        return True, [], cf_after
+        return True, cf_after
 
-    # ---------- object streams ----------
+    # -------- object streams --------
     def _devices(self, site):
-        qs = Device.objects.all().select_related("site", "role", "platform")
-        if site:
-            qs = qs.filter(site=site)
+        qs = Device.objects.all().select_related("site","role","platform")
+        if site: qs = qs.filter(site=site)
         return qs
 
     def _vms(self):
-        return VirtualMachine.objects.all().select_related("role", "platform", "cluster__site", "site", "location__site")
+        return VirtualMachine.objects.all().select_related("role","platform","cluster__site","site","location__site")
 
-    # ---------- main ----------
+    # -------- main --------
     def run(self, data, commit):
         include_devices = data.get("include_devices")
         include_vms     = data.get("include_vms")
@@ -359,13 +348,13 @@ class PrestageZabbixFromCOT(Script):
         overwrite       = data.get("overwrite")
         debug_catalog   = data.get("debug_catalog")
 
-        name_to_id, name_to_iface, by_platform = self._load_template_catalog(debug=debug_catalog)
+        name_to_id, name_to_iface, by_platform = self._load_catalog(debug=debug_catalog)
 
-        status_true = status_false = 0
-        devices_checked = vms_checked = 0
         tmpl_primary_updates = tmpl_primary_skips = 0
         ids_updated = ids_skipped = 0
+        status_true = status_false = 0
         step1_skips = step2_skips = 0
+        devices_checked = vms_checked = 0
 
         with transaction.atomic():
             streams = []
@@ -375,28 +364,27 @@ class PrestageZabbixFromCOT(Script):
             for kind, qs in streams:
                 for obj in qs:
                     if kind == "VM" and limit_site_obj is not None:
-                        sid = getattr(getattr(obj, "site", None), "id", None) \
-                              or getattr(getattr(getattr(obj, "location", None), "site", None), "id", None) \
-                              or getattr(getattr(getattr(obj, "cluster", None), "site", None), "id", None)
-                        if sid != getattr(limit_site_obj, "id", None):
+                        sid = getattr(getattr(obj,"site",None),"id",None) \
+                           or getattr(getattr(getattr(obj,"location",None),"site",None),"id",None) \
+                           or getattr(getattr(getattr(obj,"cluster",None),"site",None),"id",None)
+                        if sid != getattr(limit_site_obj,"id",None):
                             continue
 
                     if kind == "Device": devices_checked += 1
-                    else:                vms_checked += 1
+                    else:                 vms_checked += 1
 
                     cf = self._cf(obj)
 
-                    if not (self._is_true(cf.get("mon_req")) and self._norm_str(getattr(obj, "status", "")) == "active"):
+                    if not (self._is_true(cf.get("mon_req")) and self._norm(getattr(obj,"status","")) == "active"):
                         cf["mon_req"] = False
                         cf["monitoring_status"] = "Missing Required Fields"
                         step1_skips += 1
                         if commit:
-                            obj.custom_field_data = cf
-                            obj.save()
+                            obj.custom_field_data = cf; obj.save()
                         continue
 
                     plat_pk = getattr(obj, "platform_id", None)
-                    cur_name = self._norm_str(cf.get("zabbix_template_name"))
+                    cur_name = self._norm(cf.get("zabbix_template_name"))
                     cur_int  = cf.get("zabbix_template_int_id", None)
 
                     primary_name = primary_id = primary_iface = None
@@ -425,24 +413,26 @@ class PrestageZabbixFromCOT(Script):
                         self.log_info(f"[{kind}] {obj.name}: no catalog match for platform/current name")
                         step2_skips += 1
 
-                    names, seen = [], set()
+                    # Build zabbix_template_id CSV: [primary] + extras(by name)
+                    names = []
+                    seen = set()
                     if primary_name:
                         names.append(primary_name); seen.add(primary_name.lower())
-                    extra_csv = self._norm_str(cf.get("zabbix_extra_templates"))
+                    extra_csv = self._norm(cf.get("zabbix_extra_templates"))
                     if extra_csv:
                         for nm in [t.strip() for t in extra_csv.split(",") if t.strip()]:
                             if nm.lower() not in seen:
                                 names.append(nm); seen.add(nm.lower())
 
-                    id_list = []
+                    ids_list = []
                     for nm in names:
                         lid = name_to_id.get(nm.lower())
                         if lid is not None:
-                            id_list.append(str(lid))
+                            ids_list.append(str(lid))
 
-                    if id_list:
-                        old_csv = self._norm_str(cf.get("zabbix_template_id"))
-                        new_csv = ",".join(id_list)
+                    if ids_list:
+                        old_csv = self._norm(cf.get("zabbix_template_id"))
+                        new_csv = ",".join(ids_list)
                         if overwrite or old_csv != new_csv:
                             cf["zabbix_template_id"] = new_csv
                             if commit:
@@ -451,16 +441,16 @@ class PrestageZabbixFromCOT(Script):
                         else:
                             ids_skipped += 1
 
-                    sla_counts = {}
-                    cf, _ = self._ensure_sla(obj, cf, sla_counts, overwrite=overwrite)
+                    # SLA from Role
+                    cf, _ = self._ensure_sla(obj, cf, overwrite=overwrite)
                     if commit:
                         obj.custom_field_data = cf; obj.save()
 
-                    meets, _, cf_after = self._ready_eval(obj, cf)
+                    ok, cf_final = self._ready_eval(obj, cf)
                     if commit:
-                        obj.custom_field_data = cf_after; obj.save()
-                    if meets: status_true += 1
-                    else:     status_false += 1
+                        obj.custom_field_data = cf_final; obj.save()
+                    if ok: status_true += 1
+                    else:  status_false += 1
 
             if not commit:
                 self.log_info("Dry run: no changes committed."); transaction.set_rollback(True)
