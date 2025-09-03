@@ -270,7 +270,8 @@ class PrestageZabbixFromCOT(Script):
 
             # Resolve platforms → PK list
             plat_pks = []
-            # field may be 'platform' or 'platforms', value could be single, list, pk, slug, name, or Platform
+            # Resolve platforms → PK list
+            plat_pks = []
             for k in PLATFORM_KEYS:
                 if k in vals and vals[k] not in (None, "", []):
                     v = vals[k]
@@ -281,11 +282,13 @@ class PrestageZabbixFromCOT(Script):
                             plat_pks.append(item)
                         elif isinstance(item, Platform):
                             plat_pks.append(item.pk)
+                        elif isinstance(item, str) and item.strip().isdigit():
+                            plat_pks.append(int(item.strip()))          # <-- handle "9" as 9
                         else:
                             s = self._norm(item)
                             if s:
-                                hit = Platform.objects.filter(slug__iexact=s).first() or \
-                                      Platform.objects.filter(name__iexact=s).first()
+                                hit = Platform.objects.filter(slug__iexact=s).first() \
+                                or Platform.objects.filter(name__iexact=s).first()
                                 if hit:
                                     plat_pks.append(hit.pk)
 
