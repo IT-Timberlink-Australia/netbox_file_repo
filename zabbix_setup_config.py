@@ -1,25 +1,25 @@
 # NetBox Script: Prestage Zabbix fields from Custom Objects (zabbix-template-list)
-# Adapts to plugin variants:
-# - CustomObjectType may have slug or only name/label
-# - Row FK may be "object_type" or "custom_object_type"
+# Robust to plugin variants:
+# - Type lookup by slug/name/label (case-insensitive)
+# - Row FK autodetected (any ForeignKey to the Type model name)
 
 from dcim.models import Device, Site, Platform
 from virtualization.models import VirtualMachine
 from extras.scripts import Script, BooleanVar, ObjectVar
 from django.apps import apps
 from django.db import transaction
-from django.db.models import ManyToManyField
+from django.db.models import ManyToManyField, ForeignKey
 
-# Accept this selector for slug/name/label (case-insensitive)
+# Selector for your Custom Object Type (matches slug OR name OR label, case-insensitive)
 COT_TYPE_SELECTOR = "zabbix-template-list"
 
-# Field name preferences inside catalog rows
+# Preferred keys inside catalog rows (direct attrs or JSON blobs)
 NAME_KEYS   = ("template_name", "name", "template")
 ID_KEYS     = ("template_id", "id", "zabbix_template_id")
 IFACE_KEYS  = ("template_interface_id", "iface_id", "interface_id")
 PLATFORM_JSON_KEYS = ("platforms", "platform_ids", "platform_slugs", "platform_names")
 
-# Common JSON container names on Custom Object rows (we search these first)
+# Common JSON container field names on the row model
 JSON_CONTAINERS = ("data", "payload", "attributes", "values")
 
 
@@ -35,7 +35,7 @@ class PrestageZabbixFromCOT(Script):
     overwrite       = BooleanVar(description="Overwrite existing values", default=False)
     debug_catalog   = BooleanVar(description="Verbose catalog discovery logs", default=False)
 
-    # -------- helpers --------
+    # ------------ small helpers ------------
     def _norm_str(self, v): return (str(v).strip() if v is not None else "")
     def _is_true(self, v):  return str(v).lower() in {"1", "true", "yes", "on"}
     def _cf(self, obj):     return dict(getattr(obj, "custom_field_data", {}) or {})
@@ -44,7 +44,7 @@ class PrestageZabbixFromCOT(Script):
     def _has_primary_ip(self, obj):
         return bool(getattr(obj, "primary_ip4", None) or getattr(obj, "primary_ip6", None))
 
-    # -------- plugin model discovery --------
+    # ------------ plugin model discovery ------------
     def _get_cot_models(self):
         """Return (TypeModel, RowModel) from netbox_custom_objects plugin."""
         app_label = "netbox_custom_objects"
@@ -52,22 +52,11 @@ class PrestageZabbixFromCOT(Script):
         for Model in apps.get_models():
             if Model._meta.app_label.lower() != app_label:
                 continue
-            name = Model.__name__.lower()
-            # Prefer exact names if present
-            if name == "customobjecttype":
+            nm = Model.__name__.lower()
+            if "customobjecttype" in nm and Type is None:
                 Type = Model
-            elif name == "customobject":
+            elif "customobject" in nm and "type" not in nm and Row is None:
                 Row = Model
-        # Fallback: heuristic search
-        if not Type or not Row:
-            for Model in apps.get_models():
-                if Model._meta.app_label.lower() != app_label:
-                    continue
-                nm = Model.__name__.lower()
-                if (not Type) and "customobjecttype" in nm:
-                    Type = Model
-                if (not Row) and "customobject" in nm and "type" not in nm:
-                    Row = Model
         if not (Type and Row):
             raise RuntimeError("Could not locate plugin models (CustomObjectType/CustomObject).")
         return Type, Row
@@ -75,7 +64,6 @@ class PrestageZabbixFromCOT(Script):
     def _resolve_type_instance(self, Type, selector, debug=False):
         """Find the CustomObjectType by slug/name/label (case-insensitive)."""
         fields = {f.name for f in Type._meta.get_fields()}
-        # Build one or more queries in priority order
         for key in ("slug__iexact", "name__iexact", "label__iexact"):
             base = key.split("__", 1)[0]
             if base in fields:
@@ -83,29 +71,32 @@ class PrestageZabbixFromCOT(Script):
                     obj = Type.objects.filter(**{key: selector}).first()
                     if obj:
                         if debug:
-                            self.log_info(f"[COT] Matched type via {base!r}: {getattr(obj, base, None)}")
+                            val = getattr(obj, base, None)
+                            self.log_info(f"[COT] Matched type via {base!r}: {val}")
                         return obj
                 except Exception as e:
                     if debug:
                         self.log_warning(f"[COT] Lookup by {key} raised: {e}")
-        # As a last resort, take the first type and warn
+        # fallback: first available
         any_type = Type.objects.first()
         if not any_type:
             raise RuntimeError("No CustomObjectType instances found.")
         self.log_warning(f"[COT] Could not match type by slug/name/label='{selector}'. "
-                         f"Using the first available type: id={any_type.pk}, name={getattr(any_type,'name',None)}")
+                         f"Using first type id={any_type.pk}, name={getattr(any_type,'name',None)}")
         return any_type
 
     def _row_queryset_for_type(self, RowModel, type_obj, debug=False):
-        """Filter rows by FK field: object_type or custom_object_type (auto-detect)."""
-        fields = {f.name for f in RowModel._meta.get_fields()}
-        fk_name = None
-        if "object_type" in fields:
-            fk_name = "object_type"
-        elif "custom_object_type" in fields:
-            fk_name = "custom_object_type"
-        else:
-            raise RuntimeError(f"Row model {RowModel._meta.label} has no FK 'object_type' or 'custom_object_type'.")
+        """Filter rows by whichever FK on RowModel points to the Type model."""
+        fk_fields = []
+        for f in RowModel._meta.get_fields():
+            if isinstance(f, ForeignKey):
+                if f.remote_field and f.remote_field.model == type_obj.__class__:
+                    fk_fields.append(f.name)
+        if not fk_fields:
+            raise RuntimeError(f"Row model {RowModel._meta.label} has no ForeignKey to {type_obj.__class__._meta.label}.")
+        # Prefer stable names if present; else use the first detected
+        preferred_order = ["object_type", "custom_object_type", "type"]
+        fk_name = next((n for n in preferred_order if n in fk_fields), fk_fields[0])
         qs = RowModel.objects.filter(**{fk_name: type_obj})
         if debug:
             self.log_info(f"[COT] Rows model={RowModel._meta.label}, fk='{fk_name}', count={qs.count()}")
@@ -116,13 +107,12 @@ class PrestageZabbixFromCOT(Script):
         return [n for n in JSON_CONTAINERS if n in fields]
 
     def _iter_possible_blobs(self, row, preferred):
-        # 1) known containers first
+        # Known containers first, then any dict-like field
         for name in preferred:
             if hasattr(row, name):
                 blob = getattr(row, name)
                 if isinstance(blob, dict):
                     yield blob
-        # 2) any dict-like attributes
         for f in row._meta.get_fields():
             nm = getattr(f, "name", None)
             if not nm or nm in preferred:
@@ -135,7 +125,7 @@ class PrestageZabbixFromCOT(Script):
                 yield val
 
     def _get_field_from_row(self, row, keys, preferred):
-        # direct attributes
+        # Direct attributes
         for k in keys:
             if hasattr(row, k):
                 val = getattr(row, k)
@@ -251,7 +241,7 @@ class PrestageZabbixFromCOT(Script):
                           f"platform_mappings={len(by_platform)}")
         return name_to_id, (name_to_iface or None), by_platform
 
-    # -------- SLA + readiness --------
+    # ------------ SLA + readiness ------------
     def _ensure_sla(self, obj, cf, counters, overwrite=False):
         cur = self._norm_str(cf.get("sla_report_code"))
         if cur and not overwrite:
@@ -287,7 +277,7 @@ class PrestageZabbixFromCOT(Script):
         cf_after["monitoring_status"] = "Ready"
         return True, [], cf_after
 
-    # -------- streams --------
+    # ------------ object streams ------------
     def _devices(self, site):
         qs = Device.objects.all().select_related("site", "role", "platform")
         if site:
@@ -297,7 +287,7 @@ class PrestageZabbixFromCOT(Script):
     def _vms(self):
         return VirtualMachine.objects.all().select_related("role", "platform", "cluster__site", "site", "location__site")
 
-    # -------- main --------
+    # ------------ main ------------
     def run(self, data, commit):
         include_devices = data.get("include_devices")
         include_vms     = data.get("include_vms")
