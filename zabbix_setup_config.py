@@ -1,7 +1,5 @@
 # NetBox Script: Prestage Zabbix fields from Custom Objects (zabbix-template-list)
-# Robust to plugin variants:
-# - Type lookup by slug/name/label (case-insensitive)
-# - Row FK autodetected (any ForeignKey to the Type model name)
+# Variant-tolerant: works whether rows link to type via FK, *_id int field, or string marker.
 
 from dcim.models import Device, Site, Platform
 from virtualization.models import VirtualMachine
@@ -10,7 +8,7 @@ from django.apps import apps
 from django.db import transaction
 from django.db.models import ManyToManyField, ForeignKey
 
-# Selector for your Custom Object Type (matches slug OR name OR label, case-insensitive)
+# Your catalog "type" identifier (matches slug OR name OR label OR string markers on rows)
 COT_TYPE_SELECTOR = "zabbix-template-list"
 
 # Preferred keys inside catalog rows (direct attrs or JSON blobs)
@@ -19,7 +17,7 @@ ID_KEYS     = ("template_id", "id", "zabbix_template_id")
 IFACE_KEYS  = ("template_interface_id", "iface_id", "interface_id")
 PLATFORM_JSON_KEYS = ("platforms", "platform_ids", "platform_slugs", "platform_names")
 
-# Common JSON container field names on the row model
+# Likely JSON container field names on the row model
 JSON_CONTAINERS = ("data", "payload", "attributes", "values")
 
 
@@ -77,7 +75,6 @@ class PrestageZabbixFromCOT(Script):
                 except Exception as e:
                     if debug:
                         self.log_warning(f"[COT] Lookup by {key} raised: {e}")
-        # fallback: first available
         any_type = Type.objects.first()
         if not any_type:
             raise RuntimeError("No CustomObjectType instances found.")
@@ -85,21 +82,53 @@ class PrestageZabbixFromCOT(Script):
                          f"Using first type id={any_type.pk}, name={getattr(any_type,'name',None)}")
         return any_type
 
-    def _row_queryset_for_type(self, RowModel, type_obj, debug=False):
-        """Filter rows by whichever FK on RowModel points to the Type model."""
-        fk_fields = []
-        for f in RowModel._meta.get_fields():
-            if isinstance(f, ForeignKey):
-                if f.remote_field and f.remote_field.model == type_obj.__class__:
-                    fk_fields.append(f.name)
-        if not fk_fields:
-            raise RuntimeError(f"Row model {RowModel._meta.label} has no ForeignKey to {type_obj.__class__._meta.label}.")
-        # Prefer stable names if present; else use the first detected
-        preferred_order = ["object_type", "custom_object_type", "type"]
-        fk_name = next((n for n in preferred_order if n in fk_fields), fk_fields[0])
-        qs = RowModel.objects.filter(**{fk_name: type_obj})
-        if debug:
-            self.log_info(f"[COT] Rows model={RowModel._meta.label}, fk='{fk_name}', count={qs.count()}")
+    def _row_queryset_for_type(self, RowModel, type_obj, selector, debug=False):
+        """
+        Return rows for this type by:
+        1) FK to the type model, if present
+        2) *_id integer field matching the type pk (custom_object_type_id/object_type_id)
+        3) string marker on the row (type/group_name/label) matching `selector`
+        4) fallback: all rows (warn)
+        """
+        fields = {f.name: f for f in RowModel._meta.get_fields()}
+
+        # 1) FK to the type model
+        for name, f in fields.items():
+            if isinstance(f, ForeignKey) and f.remote_field and f.remote_field.model == type_obj.__class__:
+                qs = RowModel.objects.filter(**{name: type_obj})
+                if debug:
+                    self.log_info(f"[COT] Rows via FK '{name}': count={qs.count()}")
+                return qs
+
+        # 2) *_id integer field
+        for id_field in ("custom_object_type_id", "object_type_id", "type_id"):
+            if id_field in fields or hasattr(RowModel, id_field):
+                try:
+                    qs = RowModel.objects.filter(**{id_field: type_obj.pk})
+                    if debug:
+                        self.log_info(f"[COT] Rows via integer field '{id_field}': count={qs.count()}")
+                    if qs.exists():
+                        return qs
+                except Exception as e:
+                    if debug:
+                        self.log_warning(f"[COT] Integer filter on '{id_field}' raised: {e}")
+
+        # 3) string marker on the row
+        for sfield in ("type", "group_name", "label"):
+            if sfield in fields or hasattr(RowModel, sfield):
+                try:
+                    qs = RowModel.objects.filter(**{f"{sfield}__iexact": selector})
+                    if debug:
+                        self.log_info(f"[COT] Rows via string marker '{sfield}': count={qs.count()}")
+                    if qs.exists():
+                        return qs
+                except Exception as e:
+                    if debug:
+                        self.log_warning(f"[COT] String filter on '{sfield}' raised: {e}")
+
+        # 4) fallback: everything
+        qs = RowModel.objects.all()
+        self.log_warning(f"[COT] Could not narrow rows by FK/id/string. Scanning ALL rows (count={qs.count()}).")
         return qs
 
     def _json_container_names(self, Model):
@@ -157,8 +186,8 @@ class PrestageZabbixFromCOT(Script):
             s = str(val).strip()
             if not s:
                 return
-            hit = Platform.objects.filter(slug__iexact=s).first() or \
-                  Platform.objects.filter(name__iexact=s).first()
+            hit = Platform.objects.filter(slug__iexact=s).first() \
+               or Platform.objects.filter(name__iexact=s).first()
             if hit:
                 pks.add(hit.pk)
 
@@ -205,7 +234,7 @@ class PrestageZabbixFromCOT(Script):
         preferred = self._json_container_names(RowModel)
 
         type_obj = self._resolve_type_instance(Type, COT_TYPE_SELECTOR, debug=debug)
-        rows_qs = self._row_queryset_for_type(RowModel, type_obj, debug=debug)
+        rows_qs = self._row_queryset_for_type(RowModel, type_obj, COT_TYPE_SELECTOR, debug=debug)
 
         name_to_id = {}
         name_to_iface = {}
@@ -237,7 +266,7 @@ class PrestageZabbixFromCOT(Script):
                     by_platform[pk] = (name, tid, ifid)
 
         if debug:
-            self.log_info(f"[COT] Catalog rows={len(rows)}; name_to_id={len(name_to_id)}; "
+            self.log_info(f"[COT] Catalog rows_scanned={len(rows)}; name_to_id={len(name_to_id)}; "
                           f"platform_mappings={len(by_platform)}")
         return name_to_id, (name_to_iface or None), by_platform
 
