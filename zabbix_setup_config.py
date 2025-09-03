@@ -270,8 +270,6 @@ class PrestageZabbixFromCOT(Script):
 
             # Resolve platforms → PK list
             plat_pks = []
-            # Resolve platforms → PK list
-            plat_pks = []
             for k in PLATFORM_KEYS:
                 if k in vals and vals[k] not in (None, "", []):
                     v = vals[k]
