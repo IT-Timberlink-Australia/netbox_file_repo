@@ -370,4 +370,73 @@ class PrestageZabbixFromCOT(Script):
                         if needs_write(cur_name, primary_name):
                             cf["zabbix_template_name"] = primary_name
                             changed_primary = True
-                        if name_to_iface is not None and needs_write(cur_int, primary_iface_
+                        if name_to_iface is not None and needs_write(cur_int, primary_iface):
+                            cf["zabbix_template_int_id"] = primary_iface
+                            changed_primary = True
+                        if changed_primary and commit:
+                            obj.custom_field_data = cf
+                            obj.save()
+                        tmpl_primary_updates += 1 if changed_primary else 0
+                        tmpl_primary_skips   += 0 if changed_primary else 1
+                    else:
+                        self.log_info(f"[{kind}] {obj.name}: no catalog match for platform/current name")
+                        step2_skips += 1
+
+                    # Build zabbix_template_id CSV: [primary] + extras (by name)
+                    names = []
+                    seen = set()
+                    if primary_name:
+                        names.append(primary_name); seen.add(primary_name.lower())
+
+                    extra_csv = self._norm_str(cf.get("zabbix_extra_templates"))
+                    if extra_csv:
+                        for nm in [t.strip() for t in extra_csv.split(",") if t.strip()]:
+                            lname = nm.lower()
+                            if lname not in seen:
+                                names.append(nm); seen.add(lname)
+
+                    id_list = []
+                    for nm in names:
+                        lid = name_to_id.get(nm.lower())
+                        if lid is not None:
+                            id_list.append(str(lid))
+
+                    if id_list:
+                        old_csv = self._norm_str(cf.get("zabbix_template_id"))
+                        new_csv = ",".join(id_list)
+                        if overwrite or old_csv != new_csv:
+                            cf["zabbix_template_id"] = new_csv
+                            if commit:
+                                obj.custom_field_data = cf
+                                obj.save()
+                            ids_updated += 1
+                        else:
+                            ids_skipped += 1
+
+                    # SLA code from Role
+                    sla_counts = {}
+                    cf, _ = self._ensure_sla(obj, cf, sla_counts, overwrite=overwrite)
+                    if commit:
+                        obj.custom_field_data = cf
+                        obj.save()
+
+                    # Final readiness
+                    meets, _, cf_after = self._ready_eval(obj, cf)
+                    if commit:
+                        obj.custom_field_data = cf_after
+                        obj.save()
+                    if meets:
+                        status_true += 1
+                    else:
+                        status_false += 1
+
+            if not commit:
+                self.log_info("Dry run: no changes committed.")
+                transaction.set_rollback(True)
+
+        # Summary
+        self.log_info(f"Template: primary updates={tmpl_primary_updates}, primary skips={tmpl_primary_skips}")
+        self.log_info(f"Template IDs: updated={ids_updated}, skipped={ids_skipped}")
+        self.log_info(f"Status: Ready={status_true}, NotReady={status_false}; "
+                      f"Checked Devices={devices_checked}, VMs={vms_checked}; "
+                      f"Skipped Step1={step1_skips}, Step2={step2_skips}")
