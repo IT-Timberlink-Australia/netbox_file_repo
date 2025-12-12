@@ -52,7 +52,7 @@ spanning-tree trap topology-change instance {{ spanning_tree.trap_topology_chang
 {%- endif %}
 {%- if spanning_tree is defined and spanning_tree.config_name %}
 spanning-tree config-name {{ spanning_tree.config_name }}
-{%- endif -%}
+{%- endif %}
 {%- if spanning_tree is defined and spanning_tree.config_revision %}
 spanning-tree config-revision {{ spanning_tree.config_revision }}
 {%- endif %}
@@ -168,9 +168,9 @@ int {{ interface.name }}
   desc {{ interface.description|default("MGMT") }}
   no shut
 {%- for ip in interface.ip_addresses.all() %}
-{%- if ip.family == 4 %}
+{%- if ip.family == 4 -%}
   ip address {{ ip.address }}
-{%- endif %}
+{%- endif -%}
 {%- endfor %}
   {%- else %}
   shut
