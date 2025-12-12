@@ -57,7 +57,6 @@ spanning-tree config-name {{ spanning_tree.config_name }}
 spanning-tree config-revision {{ spanning_tree.config_revision }}
 {%- endif %}
 exit
-ip routing
 {# --- Interfaces --- #}
 {%- for interface in device.interfaces.all() %}
 {# SVI detection without split/regex: expect "vlan <vid>" #}
@@ -135,16 +134,16 @@ interface {{ interface.name }}
       {%- if interface.mode == "access" and interface.untagged_vlan is not none -%}
   vlan access {{ interface.untagged_vlan.vid }}
       {%- elif interface.mode == "tagged" -%}
-        {%- if interface.untagged_vlan is not none -%}
+{%- if interface.untagged_vlan is not none -%}
   vlan trunk native {{ interface.untagged_vlan.vid }}
-        {%- endif -%}
-        {%- set tvs = interface.tagged_vlans.all() -%}
-        {%- if tvs|length > 0 %}
+{%- endif -%}
+{%- set tvs = interface.tagged_vlans.all() -%}
+{%- if tvs|length > 0 %}
   vlan trunk allowed {%- for tv in tvs -%}{{ tv.vid }}{%- if not loop.last -%},{%- endif -%}{%- endfor %}
-        {%- endif %}
-        {%- if 'lag' in interface.name|lower %}
+{%- endif %}
+{%- if 'lag' in interface.name|lower %}
   lacp mode active
-        {%- endif %}
+{%- endif %}
       {%- elif interface.mode and 'tagged-all' in interface.mode|lower -%}
   vlan trunk native {{ interface.untagged_vlan.vid if interface.untagged_vlan is not none else 799 }}
   vlan trunk allowed all
