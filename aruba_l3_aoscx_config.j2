@@ -70,10 +70,10 @@ exit
 {%- if not interface.mgmt_only -%}
   {# ----- SVI path ----- #}
   {%- if is_svi -%}
-interface vlan {{ svi_vid }}
+int vlan {{ svi_vid }}
   {%- if interface.enabled -%}
-  description {{ interface.description|default("SVI-" ~ svi_vid) }}
-  no shutdown
+  desc {{ interface.description|default("SVI-" ~ svi_vid) }}
+  no shut
     {%- for ip in interface.ip_addresses.all() -%}
       {%- if ip.family == 4 -%}
   ip address {{ ip.address }}
@@ -94,17 +94,17 @@ interface vlan {{ svi_vid }}
       {%- endfor -%}
     {%- endif -%}
   {%- else -%}
-  shutdown
+  shut
   {%- endif -%}
   {# ----- Physical/LAG path ----- #}
   {%- else -%}
-interface {{ interface.name }}
+int {{ interface.name }}
   {%- if not interface.enabled %}
-  no description
-  shutdown
+  no desc
+  shut
   {%- else %}
-  description {{ interface.description|default("")|truncate(240) }}
-  no shutdown
+  desc {{ interface.description|default("")|truncate(240) }}
+  no shut
     {# Routed port if mode==routed OR interface has IPv4(s) #}
     {%- set treat_routed = (interface.mode is defined and interface.mode == "routed") -%}
     {%- if not treat_routed -%}
@@ -163,17 +163,17 @@ interface {{ interface.name }}
   {%- endif -%}
 {%- else -%}
   {# ----- mgmt_only interface ----- #}
-interface {{ interface.name }}
+int {{ interface.name }}
   {%- if interface.enabled %}
-  description {{ interface.description|default("MGMT") }}
-  no shutdown
+  desc {{ interface.description|default("MGMT") }}
+  no shut
 {%- for ip in interface.ip_addresses.all() %}
 {%- if ip.family == 4 %}
   ip address {{ ip.address }}
 {%- endif %}
 {%- endfor %}
   {%- else %}
-  shutdown
+  shut
   {%- endif -%}
 {%- endif %}
 {%- endfor %}
