@@ -31,13 +31,11 @@ no ntp server pool.ntp.org
 {%- for server in ntp_server %}
 ntp server {{ server }} minpoll 4 maxpoll 4 iburst
 {%- endfor %}
-{# --- VRFs (optional; skip "default") --- #}
-{%- for v in vrfs|default([]) -%}
-  {%- if v|lower != "default" %}
+{%- for v in vrfs|default([]) %}
+{%- if v|lower != "default" %}
 vrf {{ v }}
-  {%- endif -%}
+{%- endif %}
 {%- endfor %}
-{# --- Spanning Tree (optional) --- #}
 spanning-tree
 {%- if spanning_tree is defined and spanning_tree.config_name %}
 config-name {{ spanning_tree.config_name }}
