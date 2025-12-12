@@ -113,7 +113,7 @@ int {{ interface.name }}
           {%- set treat_routed = true -%}
         {%- endif %}
       {%- endfor -%}
-    {%- endif -%}
+    {%- endif %}
     {%- if treat_routed -%}
   routing
       {%- for ip in interface.ip_addresses.all() -%}
@@ -133,7 +133,7 @@ int {{ interface.name }}
       {# L2 modes #}
       {%- if interface.mode == "access" and interface.untagged_vlan is not none -%}
   vlan access {{ interface.untagged_vlan.vid }}
-      {%- elif interface.mode == "tagged" -%}
+      {%- elif interface.mode == "tagged" %}
   {%- if interface.untagged_vlan is not none -%}
   vlan trunk native {{ interface.untagged_vlan.vid }}
   {%- endif -%}
