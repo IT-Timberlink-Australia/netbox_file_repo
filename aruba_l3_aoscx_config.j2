@@ -25,16 +25,13 @@ ntp server {{ server }} minpoll 4 maxpoll 4 iburst {%- endfor %}
 vlan {{vl.vid }}
   name {{vl.name}}{%- endif %}{% endfor %}
 exit
-
 ip routing
-
 {# --- VRFs (optional; skip "default") --- #}
 {%- for v in vrfs|default([]) -%}
   {%- if v|lower != "default" -%}
 vrf {{ v }}
   {%- endif -%}
 {%- endfor %}
-
 {# --- Spanning Tree (optional) --- #}
 spanning-tree
 {%- if spanning_tree is defined and spanning_tree.config_name -%}
@@ -43,10 +40,8 @@ spanning-tree config-name {{ spanning_tree.config_name }}
 {%- if spanning_tree is defined and spanning_tree.config_revision -%}
 spanning-tree config-revision {{ spanning_tree.config_revision }}
 {%- endif %}
-
 {# --- Interfaces --- #}
 {%- for interface in device.interfaces.all() %}
-
 {# SVI detection without split/regex: expect "vlan <vid>" #}
 {%- set name_l = interface.name|lower -%}
 {%- set is_svi = (name_l[:5] == 'vlan ' and name_l|length > 5) -%}
@@ -55,7 +50,6 @@ spanning-tree config-revision {{ spanning_tree.config_revision }}
 {%- else -%}
   {%- set svi_vid = none -%}
 {%- endif -%}
-
 {%- if not interface.mgmt_only -%}
   {# ----- SVI path ----- #}
   {%- if is_svi -%}
@@ -85,7 +79,6 @@ interface vlan {{ svi_vid }}
     {%- else -%}
   shutdown
     {%- endif -%}
-
   {# ----- Physical/LAG path ----- #}
   {%- else -%}
 interface {{ interface.name }}
@@ -95,7 +88,6 @@ interface {{ interface.name }}
     {%- else -%}
   description {{ interface.description|default("")|truncate(240) }}
   no shutdown
-
       {# Routed port if mode==routed OR interface has IPv4(s) #}
       {%- set treat_routed = (interface.mode is defined and interface.mode == "routed") -%}
       {%- if not treat_routed -%}
@@ -153,7 +145,6 @@ interface {{ interface.name }}
       {%- endif -%}
     {%- endif -%}
   {%- endif -%}
-
 {%- else -%}
   {# ----- mgmt_only interface ----- #}
 interface {{ interface.name }}
@@ -169,9 +160,7 @@ interface {{ interface.name }}
   shutdown
   {%- endif -%}
 {%- endif %}
-
 {%- endfor %}
-
 {# --- DNS & domain --- #}
 {%- for server in name_server|default([]) -%}
 ip dns server-address {{ server }}
@@ -179,14 +168,12 @@ ip dns server-address {{ server }}
 {%- for d in domain_name|default([]) -%}
 ip domain-name {{ d }}
 {%- endfor %}
-
 {# --- SNMP --- #}
 snmp-server vrf {{ snmp_vrf|default('default') }}
 snmp-server system-location {{ device.rack|default('') }}
 snmp-server system-contact {{ snmp_system_contact|default('') }}
 snmp-server system-description {{ device.description|default('') }}
 snmp-server community {{ snmp_community|default('public') }}
-
 {# --- Static routes --- #}
 {%- if ip_routes is defined and ip_routes -%}
   {%- if ip_routes is string -%}
@@ -202,7 +189,6 @@ ip route vrf {{ vrf_name }} {{ r.prefix }} {{ r.next_hop }}{%- if r.distance is 
     {%- endfor -%}
   {%- endif -%}
 {%- endif %}
-
 {# --- OSPF global (optional) --- #}
 {%- if ospf is defined and ospf.enabled and ospf.router_id is defined -%}
   {%- set ospf_vrf = ospf.vrf|default('default') -%}
