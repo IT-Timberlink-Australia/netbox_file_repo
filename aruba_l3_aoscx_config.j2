@@ -158,10 +158,10 @@ int {{ interface.name }}
   lag {{ lagnum }}
         {%- endif -%}
       {%- endif -%}
-    {%- endif -%}
+    {%- endif %}
   {%- endif %}
   {%- endif %}
-{%- else -%}
+{%- else %}
   {# ----- mgmt_only interface ----- #}
 int {{ interface.name }}
   {%- if interface.enabled %}
