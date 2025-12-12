@@ -141,8 +141,8 @@ interface {{ interface.name }}
       {%- endif -%}
       {# LAG membership (extract numeric LAG ID) #}
       {%- if interface.lag is not none and interface.lag.name -%}
-        {%- set lagnum = interface.lag.name|lower|regex_replace('[^0-9]', '') -%}
-        {%- if lagnum and lagnum|int > 0 -%}
+        {%- set lagnum = interface.lag.name|lower|replace('lag','')|replace('ae','')|replace('port-channel','')|replace(' ','') -%}
+        {%- if lagnum and lagnum|int(0) > 0 -%}
   lag {{ lagnum }}
         {%- endif -%}
       {%- endif -%}
