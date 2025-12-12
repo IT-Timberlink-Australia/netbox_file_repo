@@ -97,7 +97,6 @@ interface {{ interface.name }}
           {%- endif -%}
         {%- endfor -%}
       {%- endif -%}
-
       {%- if treat_routed -%}
   routing
         {%- for ip in interface.ip_addresses.all() -%}
