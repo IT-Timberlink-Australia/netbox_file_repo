@@ -36,6 +36,13 @@ ntp server {{ server }} minpoll 4 maxpoll 4 iburst
 vrf {{ v }}
 {%- endif %}
 {%- endfor %}
+{%- for vl in device.site.vlans.all() %}
+{%- if vl.status != "reserved" %}
+vlan {{vl.vid }}
+  name {{vl.name}}
+{%- endif %}
+{%- endfor %}
+exit
 spanning-tree
 {%- if spanning_tree is defined and spanning_tree.priority is defined %}
 spanning-tree priority {{ spanning_tree.priority }}
@@ -49,13 +56,6 @@ spanning-tree config-name {{ spanning_tree.config_name }}
 {%- if spanning_tree is defined and spanning_tree.config_revision %}
 spanning-tree config-revision {{ spanning_tree.config_revision }}
 {%- endif %}
-exit
-{%- for vl in device.site.vlans.all() %}
-{%- if vl.status != "reserved" %}
-vlan {{vl.vid }}
-  name {{vl.name}}
-{%- endif %}
-{%- endfor %}
 exit
 ip routing
 {# --- Interfaces --- #}
