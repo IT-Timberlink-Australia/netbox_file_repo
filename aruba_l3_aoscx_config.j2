@@ -111,9 +111,9 @@ int {{ interface.name }}
       {%- for ip in interface.ip_addresses.all() -%}
         {%- if ip.family == 4 -%}
           {%- set treat_routed = true -%}
-        {%- endif -%}
+        {%- endif %}
       {%- endfor -%}
-    {%- endif %}
+    {%- endif -%}
     {%- if treat_routed -%}
   routing
       {%- for ip in interface.ip_addresses.all() -%}
