@@ -113,7 +113,7 @@ int {{ interface.name }}
           {%- set treat_routed = true -%}
         {%- endif -%}
       {%- endfor -%}
-    {%- endif -%}
+    {%- endif %}
     {%- if treat_routed -%}
   routing
       {%- for ip in interface.ip_addresses.all() -%}
