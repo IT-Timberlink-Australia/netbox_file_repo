@@ -25,7 +25,7 @@ ssh server vrf default
 clock timezone {{ device.site.time_zone }}
 ntp enable
 {%- if ntp_vrf is defined and ntp_vrf|length > 0 %}
-ntp vrf {{ ntp_vrf }}
+ntp vrf {{ ntp_vrf[0] if ntp_vrf is iterable and ntp_vrf is not string else ntp_vrf }}
 {%- endif %}
 no ntp server pool.ntp.org
 {%- for server in ntp_server %}
