@@ -35,7 +35,7 @@ ntp server {{ server }} minpoll 4 maxpoll 4 iburst
 {%- for v in vrfs|default([]) -%}
   {%- if v|lower != "default" -%}
 vrf {{ v }}
-  {%- endif -%}
+  {%- endif %}
 {%- endfor %}
 {# --- Spanning Tree (optional) --- #}
 spanning-tree
