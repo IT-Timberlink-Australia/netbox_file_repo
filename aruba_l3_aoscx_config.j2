@@ -147,9 +147,9 @@ int {{ interface.name }}
       {%- elif interface.mode and 'tagged-all' in interface.mode|lower -%}
   vlan trunk native {{ interface.untagged_vlan.vid if interface.untagged_vlan is not none else 799 }}
   vlan trunk allowed all
-        {%- if 'lag' in interface.name|lower %}
+{%- if 'lag' in interface.name|lower %}
   lacp mode active
-        {%- endif %}
+{%- endif %}
       {%- endif -%}
       {# LAG membership (extract numeric LAG ID) #}
       {%- if interface.lag is not none and interface.lag.name -%}
