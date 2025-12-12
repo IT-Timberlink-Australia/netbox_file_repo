@@ -150,7 +150,7 @@ int {{ interface.name }}
   {%- if 'lag' in interface.name|lower %}
   lacp mode active
   {%- endif %}
-      {%- endif -%}
+      {%- endif %}
       {# LAG membership (extract numeric LAG ID) #}
       {%- if interface.lag is not none and interface.lag.name -%}
         {%- set lagnum = interface.lag.name|lower|replace('lag','')|replace('ae','')|replace('port-channel','')|replace(' ','') -%}
