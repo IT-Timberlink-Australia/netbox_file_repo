@@ -31,14 +31,6 @@ no ntp server pool.ntp.org
 {%- for server in ntp_server %}
 ntp server {{ server }} minpoll 4 maxpoll 4 iburst
 {%- endfor %}
-{%- for vl in device.site.vlans.all() %}
-{%- if vl.status != "reserved" %}
-vlan {{vl.vid }}
-  name {{vl.name}}
-{%- endif %}
-{%- endfor %}
-exit
-ip routing
 {# --- VRFs (optional; skip "default") --- #}
 {%- for v in vrfs|default([]) -%}
   {%- if v|lower != "default" -%}
@@ -54,6 +46,14 @@ config-name {{ spanning_tree.config_name }}
 config-revision {{ spanning_tree.config_revision }}
 {%- endif %}
 exit
+{%- for vl in device.site.vlans.all() %}
+{%- if vl.status != "reserved" %}
+vlan {{vl.vid }}
+  name {{vl.name}}
+{%- endif %}
+{%- endfor %}
+exit
+ip routing
 {# --- Interfaces --- #}
 {%- for interface in device.interfaces.all() %}
 {# SVI detection without split/regex: expect "vlan <vid>" #}
