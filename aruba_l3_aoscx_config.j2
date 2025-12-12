@@ -15,9 +15,18 @@ aruba-central
   {{ aruba_central.status }}
   location-override {{ aruba_central.location_override_location }} vrf {{ aruba_central.location_override_vrf }}
 exit
+{%- if ssh_vrfs is defined and ssh_vrfs|length > 0 %}
+{%- for svr in ssh_vrfs %}
+ssh server vrf {{ svr }}
+{%- endfor %}
+{%- else %}
 ssh server vrf default
+{%- endif %}
 clock timezone {{ device.site.time_zone }}
 ntp enable
+{%- if ntp_vrf is defined and ntp_vrf|length > 0 %}
+ntp vrf {{ ntp_vrf }}
+{%- endif %}
 no ntp server pool.ntp.org
 {%- for server in ntp_server %}
 ntp server {{ server }} minpoll 4 maxpoll 4 iburst
@@ -166,9 +175,13 @@ interface {{ interface.name }}
 {%- endif %}
 {%- endfor %}
 {# --- DNS & domain --- #}
+{%- if nameservers is defined and nameservers|length > 0 %}
+nameserver {{ nameservers | join(' ') }}
+{%- else %}
 {%- for server in name_server|default([]) %}
 ip dns server-address {{ server }}
 {%- endfor %}
+{%- endif %}
 {%- for d in domain_name|default([]) %}
 ip domain-name {{ d }}
 {%- endfor %}
