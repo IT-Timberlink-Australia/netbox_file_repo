@@ -38,11 +38,11 @@ vrf {{ v }}
 {%- endfor %}
 {# --- Spanning Tree (optional) --- #}
 spanning-tree
-{%- if spanning_tree is defined and spanning_tree.config_name -%}
-  config-name {{ spanning_tree.config_name }}
+{%- if spanning_tree is defined and spanning_tree.config_name %}
+config-name {{ spanning_tree.config_name }}
 {%- endif -%}
-{%- if spanning_tree is defined and spanning_tree.config_revision -%}
-  config-revision {{ spanning_tree.config_revision }}
+{%- if spanning_tree is defined and spanning_tree.config_revision %}
+config-revision {{ spanning_tree.config_revision }}
 {%- endif %}
 exit
 {# --- Interfaces --- #}
@@ -87,10 +87,10 @@ interface vlan {{ svi_vid }}
   {# ----- Physical/LAG path ----- #}
   {%- else -%}
 interface {{ interface.name }}
-  {%- if not interface.enabled -%}
+  {%- if not interface.enabled %}
   no description
   shutdown
-  {%- else -%}
+  {%- else %}
   description {{ interface.description|default("")|truncate(240) }}
   no shutdown
     {# Routed port if mode==routed OR interface has IPv4(s) #}
@@ -126,18 +126,18 @@ interface {{ interface.name }}
   vlan trunk native {{ interface.untagged_vlan.vid }}
         {%- endif -%}
         {%- set tvs = interface.tagged_vlans.all() -%}
-        {%- if tvs|length > 0 -%}
+        {%- if tvs|length > 0 %}
   vlan trunk allowed {%- for tv in tvs -%}{{ tv.vid }}{%- if not loop.last -%},{%- endif -%}{%- endfor %}
-        {%- endif -%}
-        {%- if 'lag' in interface.name|lower -%}
+        {%- endif %}
+        {%- if 'lag' in interface.name|lower %}
   lacp mode active
-        {%- endif -%}
+        {%- endif %}
       {%- elif interface.mode and 'tagged-all' in interface.mode|lower -%}
   vlan trunk native {{ interface.untagged_vlan.vid if interface.untagged_vlan is not none else 799 }}
   vlan trunk allowed all
-        {%- if 'lag' in interface.name|lower -%}
+        {%- if 'lag' in interface.name|lower %}
   lacp mode active
-        {%- endif -%}
+        {%- endif %}
       {%- endif -%}
       {# LAG membership (extract numeric LAG ID) #}
       {%- if interface.lag is not none and interface.lag.name -%}
@@ -152,24 +152,24 @@ interface {{ interface.name }}
 {%- else -%}
   {# ----- mgmt_only interface ----- #}
 interface {{ interface.name }}
-  {%- if interface.enabled -%}
+  {%- if interface.enabled %}
   description {{ interface.description|default("MGMT") }}
   no shutdown
-    {%- for ip in interface.ip_addresses.all() -%}
-      {%- if ip.family == 4 -%}
+{%- for ip in interface.ip_addresses.all() %}
+{%- if ip.family == 4 %}
   ip address {{ ip.address }}
-      {%- endif -%}
-    {%- endfor -%}
-  {%- else -%}
+{%- endif %}
+{%- endfor %}
+  {%- else %}
   shutdown
   {%- endif -%}
 {%- endif %}
 {%- endfor %}
 {# --- DNS & domain --- #}
-{%- for server in name_server|default([]) -%}
+{%- for server in name_server|default([]) %}
 ip dns server-address {{ server }}
-{%- endfor -%}
-{%- for d in domain_name|default([]) -%}
+{%- endfor %}
+{%- for d in domain_name|default([]) %}
 ip domain-name {{ d }}
 {%- endfor %}
 {# --- SNMP --- #}
