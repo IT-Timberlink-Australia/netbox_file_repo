@@ -37,11 +37,17 @@ vrf {{ v }}
 {%- endif %}
 {%- endfor %}
 spanning-tree
+{%- if spanning_tree is defined and spanning_tree.priority is defined %}
+spanning-tree priority {{ spanning_tree.priority }}
+{%- endif %}
+{%- if spanning_tree is defined and spanning_tree.trap_topology_change_instance is defined %}
+spanning-tree trap topology-change instance {{ spanning_tree.trap_topology_change_instance }}
+{%- endif %}
 {%- if spanning_tree is defined and spanning_tree.config_name %}
-config-name {{ spanning_tree.config_name }}
+spanning-tree config-name {{ spanning_tree.config_name }}
 {%- endif -%}
 {%- if spanning_tree is defined and spanning_tree.config_revision %}
-config-revision {{ spanning_tree.config_revision }}
+spanning-tree config-revision {{ spanning_tree.config_revision }}
 {%- endif %}
 exit
 {%- for vl in device.site.vlans.all() %}
