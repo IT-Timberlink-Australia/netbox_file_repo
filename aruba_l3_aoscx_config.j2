@@ -70,10 +70,10 @@ exit
 {%- if not interface.mgmt_only -%}
   {# ----- SVI path ----- #}
   {%- if is_svi -%}
-int vlan {{ svi_vid }}
+interface vlan {{ svi_vid }}
   {%- if interface.enabled -%}
-  desc {{ interface.description|default("SVI-" ~ svi_vid) }}
-  no shut
+  description {{ interface.description|default("SVI-" ~ svi_vid) }}
+  no shutdown
     {%- for ip in interface.ip_addresses.all() -%}
       {%- if ip.family == 4 -%}
   ip address {{ ip.address }}
@@ -98,13 +98,13 @@ int vlan {{ svi_vid }}
   {%- endif -%}
   {# ----- Physical/LAG path ----- #}
   {%- else -%}
-int {{ interface.name }}
+interface {{ interface.name }}
   {%- if not interface.enabled %}
-  no desc
-  shut
+  no description
+  shutdown
   {%- else %}
-  desc {{ interface.description|default("")|truncate(240) }}
-  no shut
+  description {{ interface.description|default("")|truncate(240) }}
+  no shutdown
     {# Routed port if mode==routed OR interface has IPv4(s) #}
     {%- set treat_routed = (interface.mode is defined and interface.mode == "routed") -%}
     {%- if not treat_routed -%}
@@ -134,22 +134,22 @@ int {{ interface.name }}
       {%- if interface.mode == "access" and interface.untagged_vlan is not none -%}
   vlan access {{ interface.untagged_vlan.vid }}
       {%- elif interface.mode == "tagged" -%}
-{%- if interface.untagged_vlan is not none -%}
+  {%- if interface.untagged_vlan is not none -%}
   vlan trunk native {{ interface.untagged_vlan.vid }}
-{%- endif -%}
-{%- set tvs = interface.tagged_vlans.all() -%}
-{%- if tvs|length > 0 %}
+  {%- endif -%}
+  {%- set tvs = interface.tagged_vlans.all() -%}
+  {%- if tvs|length > 0 %}
   vlan trunk allowed {%- for tv in tvs -%}{{ tv.vid }}{%- if not loop.last -%},{%- endif -%}{%- endfor %}
-{%- endif %}
-{%- if 'lag' in interface.name|lower %}
+  {%- endif %}
+  {%- if 'lag' in interface.name|lower %}
   lacp mode active
-{%- endif %}
+  {%- endif %}
       {%- elif interface.mode and 'tagged-all' in interface.mode|lower -%}
   vlan trunk native {{ interface.untagged_vlan.vid if interface.untagged_vlan is not none else 799 }}
   vlan trunk allowed all
-{%- if 'lag' in interface.name|lower %}
+  {%- if 'lag' in interface.name|lower %}
   lacp mode active
-{%- endif %}
+  {%- endif %}
       {%- endif -%}
       {# LAG membership (extract numeric LAG ID) #}
       {%- if interface.lag is not none and interface.lag.name -%}
@@ -163,17 +163,17 @@ int {{ interface.name }}
   {%- endif -%}
 {%- else -%}
   {# ----- mgmt_only interface ----- #}
-int {{ interface.name }}
+interface {{ interface.name }}
   {%- if interface.enabled %}
-  desc {{ interface.description|default("MGMT") }}
-  no shut
-{%- for ip in interface.ip_addresses.all() %}
-{%- if ip.family == 4 -%}
+  description {{ interface.description|default("MGMT") }}
+  no shutdown
+  {%- for ip in interface.ip_addresses.all() %}
+  {%- if ip.family == 4 %}
   ip address {{ ip.address }}
-{%- endif -%}
-{%- endfor %}
+  {%- endif %}
+  {%- endfor %}
   {%- else %}
-  shut
+  shutdown
   {%- endif -%}
 {%- endif %}
 {%- endfor %}
